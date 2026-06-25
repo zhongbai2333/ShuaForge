@@ -1,0 +1,23 @@
+[
+  {
+    "id": "rust-001",
+    "prompt": "Rust 中用于表示所有权借用的符号是什么？",
+    "answer": "&",
+    "explanation": "&T 表示不可变借用，&mut T 表示可变借用。借用允许访问值而不取得所有权。",
+    "tags": ["rust", "ownership"]
+  },
+  {
+    "id": "algo-001",
+    "prompt": "二分查找要求输入序列满足什么基本条件？",
+    "answer": "有序",
+    "explanation": "二分查找依赖有序性，每次通过中点比较排除一半搜索空间。",
+    "tags": ["algorithm", "binary-search"]
+  },
+  {
+    "id": "english-001",
+    "prompt": "英文单词 concise 的中文含义是什么？",
+    "answer": "简洁",
+    "explanation": "concise 表示表达简短而清楚，常用于描述文字或说明。",
+    "tags": ["english"]
+  }
+]

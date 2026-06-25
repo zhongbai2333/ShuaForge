@@ -1,0 +1,7 @@
+{
+  "enabled": false,
+  "endpoint": "https://api.example.com/v1/chat/completions",
+  "api_key": "",
+  "model": "your-model-name",
+  "timeout_secs": 30
+}

@@ -1,0 +1,13 @@
+{
+  "name": "shuaforge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "ShuaForge desktop quiz assistant and userscript tools.",
+  "scripts": {
+    "build:userscript": "tsc -p tsconfig.userscripts.json",
+    "check:userscript": "tsc -p tsconfig.userscripts.json --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.2"
+  }
+}
