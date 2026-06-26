@@ -20,6 +20,12 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
       - name: Cache cargo artifacts
         uses: actions/cache@v4
         with:
@@ -33,6 +39,11 @@ jobs:
 
       - name: Build release binary
         run: cargo build --release --locked
+
+      - name: Build userscript
+        run: |
+          npm ci
+          npm run build:userscript
 
       - name: Package release assets
         shell: pwsh
