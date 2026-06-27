@@ -19,6 +19,8 @@ ureq = { version = "3.1", features = ["json"] }
 zip = { version = "4.3", default-features = false, features = ["deflate"] }
 
 [profile.release]
+opt-level = "z"
 strip = true
 lto = "thin"
 codegen-units = 1
+panic = "abort"

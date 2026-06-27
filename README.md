@@ -35,6 +35,20 @@ ShuaForge 是一个用 Rust + egui 开发的轻量桌面刷题助手。目标是
 cargo run
 ```
 
+## 发布构建产物
+
+Release 工作流会在推送 `v*` 标签或手动触发时构建并上传这些桌面端产物：
+
+- Windows x64：`.zip`，包含 `shuaforge.exe` 与 README
+- Linux x64：`.zip`，包含 `shuaforge` 与 README
+- Linux arm64：`.zip`，包含 `shuaforge` 与 README
+- macOS x64：`.dmg`
+- macOS arm64：`.dmg`
+
+注意：GitHub 已下架 macOS Intel hosted runner，因此 macOS x64 产物会在 `macos-latest` 上通过 `x86_64-apple-darwin` target 交叉编译；macOS arm64 产物使用 `aarch64-apple-darwin` target 构建。
+
+CI、PR 标签构建和 Release 发布共用 `.github/workflows/desktop-build.yml` 中的同一套桌面端构建矩阵，避免某个平台的打包逻辑只在发布时才暴露问题。
+
 打开后点击“导入题库”，可选择：
 
 - `examples/problems.sample.json`

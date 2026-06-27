@@ -1,0 +1,154 @@
+name: Desktop Build
+
+"on":
+    workflow_call:
+        inputs:
+            ref:
+                description: "Git ref to checkout before building. Defaults to the caller ref."
+                required: false
+                type: string
+            version:
+                description: "Version suffix used in uploaded desktop artifacts."
+                required: true
+                type: string
+            artifact-prefix:
+                description: "Prefix for uploaded GitHub Actions artifact names."
+                required: false
+                type: string
+                default: desktop-build
+
+permissions:
+    contents: read
+
+jobs:
+    build:
+        name: Build ${{ matrix.name }} desktop package
+        runs-on: ${{ matrix.os }}
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - name: Windows x64
+                      os: windows-latest
+                      artifact_name: Windows-x64
+                      target: x86_64-pc-windows-msvc
+                      binary_name: shuaforge.exe
+                    - name: Linux x64
+                      os: ubuntu-latest
+                      artifact_name: Linux-x64
+                      target: x86_64-unknown-linux-gnu
+                      binary_name: shuaforge
+                    - name: Linux arm64
+                      os: ubuntu-24.04-arm
+                      artifact_name: Linux-arm64
+                      target: aarch64-unknown-linux-gnu
+                      binary_name: shuaforge
+                    # GitHub no longer provides macOS Intel hosted runners; build Intel on macos-latest via Rust cross target.
+                    - name: macOS x64
+                      os: macos-latest
+                      artifact_name: macOS-x64
+                      target: x86_64-apple-darwin
+                      binary_name: shuaforge
+                    - name: macOS arm64
+                      os: macos-latest
+                      artifact_name: macOS-arm64
+                      target: aarch64-apple-darwin
+                      binary_name: shuaforge
+
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+              with:
+                  ref: ${{ inputs.ref || github.ref }}
+
+            - name: Install Rust
+              uses: dtolnay/rust-toolchain@stable
+              with:
+                  targets: ${{ matrix.target }}
+
+            - name: Install Linux dependencies
+              if: runner.os == 'Linux'
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y libgtk-3-dev libxdo-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
+
+            - name: Cache cargo artifacts
+              uses: actions/cache@v4
+              with:
+                  path: |
+                      ~/.cargo/registry
+                      ~/.cargo/git
+                      target
+                  key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('Cargo.lock') }}
+                  restore-keys: |
+                      ${{ runner.os }}-${{ matrix.target }}-cargo-
+                      ${{ runner.os }}-cargo-
+
+            - name: Build release binary
+              run: cargo build --release --locked --target ${{ matrix.target }}
+
+            - name: Package desktop artifact
+              shell: pwsh
+              run: |
+                  $ErrorActionPreference = 'Stop'
+                  $artifactName = '${{ matrix.artifact_name }}'
+                  $binaryName = '${{ matrix.binary_name }}'
+                  $binaryPath = Join-Path 'target/${{ matrix.target }}/release' $binaryName
+                  $version = '${{ inputs.version }}'
+                  $assetDir = 'desktop-assets'
+                  New-Item -ItemType Directory -Force -Path $assetDir | Out-Null
+
+                  if ('${{ runner.os }}' -eq 'macOS') {
+                    $appRoot = 'dist/ShuaForge.app'
+                    $macOsDir = Join-Path $appRoot 'Contents/MacOS'
+                    $resourcesDir = Join-Path $appRoot 'Contents/Resources'
+                    New-Item -ItemType Directory -Force -Path $macOsDir, $resourcesDir | Out-Null
+                    Copy-Item $binaryPath (Join-Path $macOsDir 'ShuaForge') -Force
+                    chmod +x (Join-Path $macOsDir 'ShuaForge')
+                    $appVersion = $version -replace '^v', ''
+                    if ($appVersion -notmatch '^\d+(\.\d+){0,2}([-.+][A-Za-z0-9.-]+)?$') {
+                      $appVersion = '0.0.0'
+                    }
+                    $plist = @(
+                      '<?xml version="1.0" encoding="UTF-8"?>',
+                      '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
+                      '<plist version="1.0">',
+                      '<dict>',
+                      '  <key>CFBundleDisplayName</key>',
+                      '  <string>ShuaForge</string>',
+                      '  <key>CFBundleExecutable</key>',
+                      '  <string>ShuaForge</string>',
+                      '  <key>CFBundleIdentifier</key>',
+                      '  <string>io.github.zhongbai2333.shuaforge</string>',
+                      '  <key>CFBundleName</key>',
+                      '  <string>ShuaForge</string>',
+                      '  <key>CFBundlePackageType</key>',
+                      '  <string>APPL</string>',
+                      '  <key>CFBundleShortVersionString</key>',
+                      "  <string>$appVersion</string>",
+                      '  <key>CFBundleVersion</key>',
+                      '  <string>${{ github.run_number }}</string>',
+                      '  <key>LSMinimumSystemVersion</key>',
+                      '  <string>11.0</string>',
+                      '  <key>NSHighResolutionCapable</key>',
+                      '  <true/>',
+                      '</dict>',
+                      '</plist>'
+                    )
+                    $plist | Set-Content -Path (Join-Path $appRoot 'Contents/Info.plist') -Encoding UTF8
+
+                    hdiutil create -volname 'ShuaForge' -srcfolder $appRoot -ov -format UDZO (Join-Path $assetDir "ShuaForge-$artifactName-$version.dmg")
+                  } else {
+                    $distDir = 'dist'
+                    New-Item -ItemType Directory -Force -Path $distDir | Out-Null
+                    Copy-Item $binaryPath $distDir -Force
+                    Copy-Item README.md $distDir -Force
+                    Compress-Archive -Path (Join-Path $distDir '*') -DestinationPath (Join-Path $assetDir "ShuaForge-$artifactName-$version.zip") -Force
+                  }
+
+            - name: Upload desktop artifact
+              uses: actions/upload-artifact@v4
+              with:
+                  name: ${{ inputs.artifact-prefix }}-${{ matrix.artifact_name }}
+                  path: desktop-assets/ShuaForge-${{ matrix.artifact_name }}-${{ inputs.version }}*
+                  if-no-files-found: error

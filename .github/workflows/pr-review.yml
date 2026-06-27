@@ -1,137 +1,81 @@
 name: PR 标签触发多平台构建
 
 on:
-  pull_request:
-    types: [labeled]
+    pull_request:
+        types: [labeled]
 
 permissions:
-  contents: read
-  pull-requests: read
-  issues: write
+    contents: read
+    pull-requests: read
+    issues: write
 
 jobs:
-  cancel_if_unrelated:
-    runs-on: ubuntu-latest
-    if: github.event.label.name != 'run-build' && github.event.label.name != 'Run-Build' && github.event.label.name != 'RUN-BUILD'
-    steps:
-      - name: 非目标标签，取消本次 Workflow
-        uses: styfle/cancel-workflow-action@0.9.1
+    cancel_if_unrelated:
+        runs-on: ubuntu-latest
+        if: github.event.label.name != 'run-build' && github.event.label.name != 'Run-Build' && github.event.label.name != 'RUN-BUILD'
+        steps:
+            - name: 非目标标签，取消本次 Workflow
+              uses: styfle/cancel-workflow-action@0.9.1
+              with:
+                  access_token: ${{ secrets.GITHUB_TOKEN }}
+
+    build-desktop:
+        if: github.event.label.name == 'run-build' || github.event.label.name == 'Run-Build' || github.event.label.name == 'RUN-BUILD'
+        name: Build desktop packages
+        uses: ./.github/workflows/desktop-build.yml
         with:
-          access_token: ${{ secrets.GITHUB_TOKEN }}
+            version: sha-${{ github.event.pull_request.head.sha }}
+            artifact-prefix: shuaforge
 
-  build:
-    if: github.event.label.name == 'run-build' || github.event.label.name == 'Run-Build' || github.event.label.name == 'RUN-BUILD'
-    name: Build ${{ matrix.name }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Windows x64
-            os: windows-latest
-            artifact_name: Windows-x64
-            binary_name: shuaforge.exe
-          - name: Linux x64
-            os: ubuntu-latest
-            artifact_name: Linux-x64
-            binary_name: shuaforge
-          - name: macOS
-            os: macos-latest
-            artifact_name: macOS
-            binary_name: shuaforge
-    steps:
-      - name: Checkout PR 源分支代码
-        uses: actions/checkout@v4
+    check-userscript:
+        if: github.event.label.name == 'run-build' || github.event.label.name == 'Run-Build' || github.event.label.name == 'RUN-BUILD'
+        name: Check userscript
+        runs-on: ubuntu-latest
+        steps:
+            - name: Checkout PR 源分支代码
+              uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+            - name: Install Node.js
+              uses: actions/setup-node@v4
+              with:
+                  node-version: 22
+                  cache: npm
 
-      - name: Install Linux dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libxdo-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
+            - name: Check and build userscript
+              run: |
+                  npm ci
+                  npm run check:userscript
+                  npm run build:userscript
 
-      - name: Cache cargo artifacts
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: pr-${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            pr-${{ runner.os }}-cargo-
+            - name: Upload userscript artifact
+              uses: actions/upload-artifact@v4
+              with:
+                  name: shuaforge-userscript-build
+                  path: userscripts/shuaforge-question-exporter.user.js
+                  if-no-files-found: error
 
-      - name: Build release binary
-        run: cargo build --release --locked
-
-      - name: Bundle artifacts
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          $version = "sha-${{ github.event.pull_request.head.sha }}"
-          $out = "ShuaForge-${{ matrix.artifact_name }}-$version"
-          if ('${{ runner.os }}' -eq 'Windows') { $out = "$out.exe" }
-          Copy-Item "target/release/${{ matrix.binary_name }}" (Join-Path dist $out) -Force
-
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: shuaforge-${{ matrix.artifact_name }}-build
-          path: dist/ShuaForge-*
-          if-no-files-found: error
-
-  check-userscript:
-    if: github.event.label.name == 'run-build' || github.event.label.name == 'Run-Build' || github.event.label.name == 'RUN-BUILD'
-    name: Check userscript
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout PR 源分支代码
-        uses: actions/checkout@v4
-
-      - name: Install Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-
-      - name: Check and build userscript
-        run: |
-          npm ci
-          npm run check:userscript
-          npm run build:userscript
-
-      - name: Upload userscript artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: shuaforge-userscript-build
-          path: userscripts/shuaforge-question-exporter.user.js
-          if-no-files-found: error
-
-  build-on-label:
-    needs:
-      - build
-      - check-userscript
-    if: github.event.label.name == 'run-build' || github.event.label.name == 'Run-Build' || github.event.label.name == 'RUN-BUILD'
-    runs-on: ubuntu-latest
-    steps:
-      - name: 评论并删除标签
-        uses: actions/github-script@v7
-        continue-on-error: true
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            await github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: '✅ ShuaForge 多平台构建完成，已生成桌面端可执行文件与 userscript 检查产物。'
-            });
-            await github.rest.issues.removeLabel({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              name: context.payload.label.name
-            });
+    build-on-label:
+        needs:
+            - build-desktop
+            - check-userscript
+        if: github.event.label.name == 'run-build' || github.event.label.name == 'Run-Build' || github.event.label.name == 'RUN-BUILD'
+        runs-on: ubuntu-latest
+        steps:
+            - name: 评论并删除标签
+              uses: actions/github-script@v7
+              continue-on-error: true
+              with:
+                  github-token: ${{ secrets.GITHUB_TOKEN }}
+                  script: |
+                      await github.rest.issues.createComment({
+                        issue_number: context.issue.number,
+                        owner: context.repo.owner,
+                        repo: context.repo.repo,
+                        body: '✅ ShuaForge 多平台构建完成，已生成桌面端安装包与 userscript 检查产物。'
+                      });
+                      await github.rest.issues.removeLabel({
+                        issue_number: context.issue.number,
+                        owner: context.repo.owner,
+                        repo: context.repo.repo,
+                        name: context.payload.label.name
+                      });

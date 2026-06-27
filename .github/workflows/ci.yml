@@ -1,67 +1,80 @@
 name: CI
 
 on:
-  push:
-    branches: ["main", "dev"]
-    paths:
-      - "src/**"
-      - "userscripts/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/workflows/ci.yml"
-  pull_request:
-    branches: ["main", "dev"]
-    paths:
-      - "src/**"
-      - "userscripts/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/workflows/ci.yml"
-  workflow_dispatch:
+    push:
+        branches: ["main", "dev"]
+        paths:
+            - "src/**"
+            - "userscripts/**"
+            - "Cargo.toml"
+            - "Cargo.lock"
+            - ".github/workflows/ci.yml"
+            - ".github/workflows/desktop-build.yml"
+            - ".github/workflows/pr-review.yml"
+            - ".github/workflows/release.yml"
+    pull_request:
+        branches: ["main", "dev"]
+        paths:
+            - "src/**"
+            - "userscripts/**"
+            - "Cargo.toml"
+            - "Cargo.lock"
+            - ".github/workflows/ci.yml"
+            - ".github/workflows/desktop-build.yml"
+            - ".github/workflows/pr-review.yml"
+            - ".github/workflows/release.yml"
+    workflow_dispatch:
 
 permissions:
-  contents: read
+    contents: read
 
 jobs:
-  test:
-    name: fmt / clippy / test
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+    test:
+        name: fmt / clippy / test
+        runs-on: ubuntu-latest
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+            - name: Install Rust
+              uses: dtolnay/rust-toolchain@stable
+              with:
+                  components: rustfmt, clippy
+
+            - name: Install Node.js
+              uses: actions/setup-node@v4
+              with:
+                  node-version: 22
+                  cache: npm
+
+            - name: Cache cargo artifacts
+              uses: actions/cache@v4
+              with:
+                  path: |
+                      ~/.cargo/registry
+                      ~/.cargo/git
+                      target
+                  key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+                  restore-keys: |
+                      ${{ runner.os }}-cargo-
+
+            - name: Check formatting
+              run: cargo fmt --all -- --check
+
+            - name: Run Clippy
+              run: cargo clippy --all-targets --all-features -- -D warnings
+
+            - name: Run tests
+              run: cargo test --all --all-features
+
+            - name: Check userscript
+              run: |
+                  npm ci
+                  npm run check:userscript
+
+    build-desktop:
+        name: Build desktop packages
+        uses: ./.github/workflows/desktop-build.yml
         with:
-          components: rustfmt, clippy
-
-      - name: Install Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-
-      - name: Cache cargo artifacts
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      - name: Run Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-
-      - name: Run tests
-        run: cargo test --all --all-features
-
-      - name: Check userscript
-        run: |
-          npm ci
-          npm run check:userscript
+            version: ci-${{ github.sha }}
+            artifact-prefix: ci-desktop
