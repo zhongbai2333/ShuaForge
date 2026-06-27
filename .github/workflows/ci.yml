@@ -58,6 +58,12 @@ jobs:
                   restore-keys: |
                       ${{ runner.os }}-cargo-
 
+            - name: Check and build embedded userscript
+              run: |
+                  npm ci
+                  npm run check:userscript
+                  npm run build:userscript
+
             - name: Check formatting
               run: cargo fmt --all -- --check
 
@@ -66,11 +72,6 @@ jobs:
 
             - name: Run tests
               run: cargo test --all --all-features
-
-            - name: Check userscript
-              run: |
-                  npm ci
-                  npm run check:userscript
 
     build-desktop:
         name: Build desktop packages
