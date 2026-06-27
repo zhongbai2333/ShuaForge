@@ -5,6 +5,7 @@ use crate::{
         save_ai_config, stream_problem_set_analysis_tool,
     },
     deck::{PracticeDeck, PracticeOrder, SubmitResult},
+    logging,
     problem::{Problem, ProblemType, load_problems, normalize_choice_answer},
     self_update::{self, UpdateInfo, UpdateOutcome},
     store::{AnswerRecord, AppStore, DeckCard, GroupCard},
@@ -388,17 +389,23 @@ pub struct ShuaForgeApp {
     new_group_name: String,
     dragging_deck_id: Option<i64>,
     dragging_group_id: Option<i64>,
+    log_path: Option<PathBuf>,
 }
 
 impl ShuaForgeApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, log_path: Option<PathBuf>) -> Self {
         configure_fonts(&cc.egui_ctx);
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        log::info!("Initializing ShuaForge application state");
 
         let mut status = "请导入题库开始练习。支持 JSON / CSV / ZIP 格式。".to_owned();
         let store = match AppStore::open_default() {
-            Ok(store) => Some(store),
+            Ok(store) => {
+                log::info!("Opened local SQLite store");
+                Some(store)
+            }
             Err(err) => {
+                log::error!("Failed to open local SQLite store: {err}");
                 status = format!("本地数据库打开失败：{err}");
                 None
             }
@@ -456,6 +463,7 @@ impl ShuaForgeApp {
             new_group_name: "新题组".into(),
             dragging_deck_id: None,
             dragging_group_id: None,
+            log_path,
         };
         app.load_analysis_cache();
         app.load_analysis_text_cache();
@@ -508,7 +516,29 @@ impl ShuaForgeApp {
 
     fn open_url(&mut self, url: &str) {
         if let Err(err) = webbrowser::open(url) {
+            log::warn!("Failed to open URL {url}: {err}");
             self.status = format!("打开链接失败：{err}");
+        }
+    }
+
+    fn export_logs(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("日志压缩包", &["zip"])
+            .set_file_name(logging::default_export_file_name())
+            .save_file()
+        else {
+            return;
+        };
+
+        match logging::export_logs_to(&path) {
+            Ok(()) => {
+                log::info!("Exported logs to {}", path.display());
+                self.status = format!("日志已导出到：{}", path.display());
+            }
+            Err(err) => {
+                log::error!("Failed to export logs to {}: {err}", path.display());
+                self.status = format!("日志导出失败：{err}");
+            }
         }
     }
 
@@ -633,9 +663,13 @@ impl ShuaForgeApp {
             .add_filter("题库", &["json", "csv", "zip"])
             .pick_file()
         {
+            log::info!("Importing problem bank from {}", path.display());
             match load_problems(&path) {
                 Ok(problems) => self.import_and_load_problems(path, problems),
-                Err(err) => self.status = format!("导入失败：{err}"),
+                Err(err) => {
+                    log::error!("Problem bank import failed: {err}");
+                    self.status = format!("导入失败：{err}");
+                }
             }
         }
     }
@@ -644,13 +678,22 @@ impl ShuaForgeApp {
         if let Some(store) = self.store.as_mut() {
             match store.import_problems(&problems, &path.display().to_string()) {
                 Ok(summary) => {
+                    log::info!(
+                        "Imported problem bank: imported={}, inserted={}, updated={}",
+                        summary.imported,
+                        summary.inserted,
+                        summary.updated
+                    );
                     self.status = format!(
                         "导入 {} 道题：新增 {}，更新 {}。已保存到题库列表。",
                         summary.imported, summary.inserted, summary.updated
                     );
                     self.active_deck_name = None;
                 }
-                Err(err) => self.status = format!("题库已读入，但保存 SQLite 失败：{err}"),
+                Err(err) => {
+                    log::error!("Saving imported problems to SQLite failed: {err}");
+                    self.status = format!("题库已读入，但保存 SQLite 失败：{err}");
+                }
             }
             self.refresh_store_state();
         }
@@ -1785,6 +1828,17 @@ impl ShuaForgeApp {
                     }
                     ui.small("许可证：MIT License");
                 });
+
+                ui.separator();
+                ui.heading("日志");
+                if let Some(path) = &self.log_path {
+                    ui.small(format!("当前日志：{}", path.display()));
+                } else {
+                    ui.small("日志文件尚未成功初始化。");
+                }
+                if ui.button("导出日志").clicked() {
+                    self.export_logs();
+                }
 
                 ui.separator();
                 ui.heading("更新");

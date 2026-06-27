@@ -60,10 +60,12 @@ impl AppStore {
     }
 
     pub fn open(path: PathBuf) -> Result<Self, Box<dyn Error + Send + Sync>> {
+        log::info!("Opening SQLite store: path={}", path.display());
         let conn = Connection::open(path)?;
         conn.execute_batch("pragma foreign_keys = on;")?;
         let store = Self { conn };
         store.migrate()?;
+        log::info!("SQLite store opened and migrated");
         Ok(store)
     }
 
@@ -72,6 +74,11 @@ impl AppStore {
         problems: &[Problem],
         source_path: &str,
     ) -> Result<ImportSummary, Box<dyn Error + Send + Sync>> {
+        log::info!(
+            "Persisting problem import: source_path={}, problem_count={}",
+            source_path,
+            problems.len()
+        );
         let tx = self.conn.transaction()?;
         let deck_name = problems
             .iter()
@@ -170,6 +177,15 @@ impl AppStore {
             ],
         )?;
         tx.commit()?;
+        log::info!(
+            "Problem import persisted: deck_id={}, deck_name={}, imported={}, inserted={}, updated={}, deck_problem_count={}",
+            summary.deck_id,
+            deck_name,
+            summary.imported,
+            summary.inserted,
+            summary.updated,
+            problem_count
+        );
         Ok(summary)
     }
 
@@ -228,7 +244,9 @@ impl AppStore {
              values (?1, datetime('now', 'localtime'))",
             params![name],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        let group_id = self.conn.last_insert_rowid();
+        log::info!("Group persisted: group_id={}, name={}", group_id, name);
+        Ok(group_id)
     }
 
     pub fn add_deck_to_group(
@@ -244,6 +262,11 @@ impl AppStore {
             "update deck_groups set updated_at = datetime('now', 'localtime') where id = ?1",
             params![group_id],
         )?;
+        log::info!(
+            "Deck added to group: group_id={}, deck_id={}",
+            group_id,
+            deck_id
+        );
         Ok(())
     }
 
@@ -260,6 +283,11 @@ impl AppStore {
             "update deck_groups set updated_at = datetime('now', 'localtime') where id = ?1",
             params![group_id],
         )?;
+        log::info!(
+            "Deck removed from group: group_id={}, deck_id={}",
+            group_id,
+            deck_id
+        );
         Ok(())
     }
 
@@ -270,6 +298,7 @@ impl AppStore {
             let rows = stmt.query_map(params![deck_id], |row| row.get::<_, String>(0))?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
+        let candidate_problem_count = problem_ids.len();
 
         tx.execute("delete from decks where id = ?1", params![deck_id])?;
 
@@ -285,12 +314,18 @@ impl AppStore {
         }
 
         tx.commit()?;
+        log::info!(
+            "Deck deleted: deck_id={}, candidate_problem_count={}",
+            deck_id,
+            candidate_problem_count
+        );
         Ok(())
     }
 
     pub fn delete_group(&self, group_id: i64) -> Result<(), Box<dyn Error + Send + Sync>> {
         self.conn
             .execute("delete from deck_groups where id = ?1", params![group_id])?;
+        log::info!("Group deleted: group_id={}", group_id);
         Ok(())
     }
 
@@ -424,6 +459,13 @@ impl AppStore {
              values (datetime('now', 'localtime'), ?1, ?2, ?3, ?4)",
             params![problem_id, user_answer, correct_answer, i64::from(is_correct)],
         )?;
+        log::info!(
+            "Answer record persisted: problem_id={}, is_correct={}, user_answer_chars={}, correct_answer_chars={}",
+            problem_id,
+            is_correct,
+            user_answer.chars().count(),
+            correct_answer.chars().count()
+        );
         Ok(())
     }
 
@@ -528,6 +570,11 @@ impl AppStore {
                updated_at = datetime('now', 'localtime')",
             params![key, value],
         )?;
+        log::info!(
+            "Setting persisted: key={}, value_chars={}",
+            key,
+            value.chars().count()
+        );
         Ok(())
     }
 
@@ -633,6 +680,11 @@ impl AppStore {
              select ?1, id from problems",
             params![deck_id],
         )?;
+        log::info!(
+            "Legacy deck seeded: deck_id={}, problem_count={}",
+            deck_id,
+            problem_count
+        );
         Ok(())
     }
 }

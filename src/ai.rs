@@ -1,4 +1,4 @@
-use crate::{problem::Problem, store::AnswerRecord};
+use crate::{logging, problem::Problem, store::AnswerRecord};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
@@ -7,6 +7,7 @@ use std::{
     io::{BufRead, BufReader},
     path::Path,
     sync::mpsc,
+    time::Instant,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -147,14 +148,20 @@ pub fn explain_wrong_answer(
     user_answer: &str,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
     if !config.enabled {
+        log::info!("AI explain skipped: disabled, problem_id={}", problem.id);
         return Ok(local_explanation(problem, user_answer));
     }
 
     if config.endpoint.trim().is_empty() || config.model.trim().is_empty() {
+        log::warn!(
+            "AI explain skipped: endpoint/model missing, problem_id={}",
+            problem.id
+        );
         return Ok("AI 已启用，但 endpoint/model 未配置。请先在配置区填写。".into());
     }
 
     let body = build_ai_request_body(config, build_prompt(problem, user_answer))?;
+    let started = log_ai_request_start("explain_wrong_answer", config, &body, false);
     let mut req = minreq::post(&config.endpoint)
         .with_header("content-type", "application/json")
         .with_timeout(config.timeout_secs)
@@ -164,8 +171,20 @@ pub fn explain_wrong_answer(
         req = req.with_header("authorization", format!("Bearer {}", config.api_key.trim()));
     }
 
-    let response = req.send()?;
+    let response = match req.send() {
+        Ok(response) => response,
+        Err(err) => {
+            log_ai_transport_error("explain_wrong_answer", started, &err);
+            return Err(err.into());
+        }
+    };
     if response.status_code < 200 || response.status_code >= 300 {
+        log_ai_response(
+            "explain_wrong_answer",
+            started,
+            response.status_code,
+            response.as_str().ok(),
+        );
         return Err(format_ai_http_error(
             response.status_code,
             &config.endpoint,
@@ -175,6 +194,12 @@ pub fn explain_wrong_answer(
     }
 
     let text = response.as_str()?;
+    log_ai_response(
+        "explain_wrong_answer",
+        started,
+        response.status_code,
+        Some(text),
+    );
     extract_explanation(text)
         .or_else(|| Some(text.to_string()))
         .ok_or_else(|| "AI 响应为空".into())
@@ -186,14 +211,20 @@ pub fn review_answer(
     user_answer: &str,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
     if !config.enabled {
+        log::info!("AI review skipped: disabled, problem_id={}", problem.id);
         return Ok(local_review(problem, user_answer));
     }
 
     if config.endpoint.trim().is_empty() || config.model.trim().is_empty() {
+        log::warn!(
+            "AI review skipped: endpoint/model missing, problem_id={}",
+            problem.id
+        );
         return Ok("AI 批改需要先启用并填写 endpoint/model。".into());
     }
 
     let body = build_ai_request_body(config, build_review_prompt(problem, user_answer))?;
+    let started = log_ai_request_start("review_answer", config, &body, false);
     let mut req = minreq::post(&config.endpoint)
         .with_header("content-type", "application/json")
         .with_timeout(config.timeout_secs)
@@ -203,8 +234,20 @@ pub fn review_answer(
         req = req.with_header("authorization", format!("Bearer {}", config.api_key.trim()));
     }
 
-    let response = req.send()?;
+    let response = match req.send() {
+        Ok(response) => response,
+        Err(err) => {
+            log_ai_transport_error("review_answer", started, &err);
+            return Err(err.into());
+        }
+    };
     if response.status_code < 200 || response.status_code >= 300 {
+        log_ai_response(
+            "review_answer",
+            started,
+            response.status_code,
+            response.as_str().ok(),
+        );
         return Err(format_ai_http_error(
             response.status_code,
             &config.endpoint,
@@ -214,6 +257,7 @@ pub fn review_answer(
     }
 
     let text = response.as_str()?;
+    log_ai_response("review_answer", started, response.status_code, Some(text));
     extract_explanation(text)
         .or_else(|| Some(text.to_string()))
         .ok_or_else(|| "AI 响应为空".into())
@@ -287,12 +331,21 @@ pub fn stream_problem_set_analysis_tool(
     });
 
     if problems.is_empty() {
+        log::info!("Problem set analysis skipped: empty title={title}");
         let _ = sender.send(AnalysisStreamEvent::TextDelta("没有可分析的题目。".into()));
         let _ = sender.send(AnalysisStreamEvent::Finished);
         return;
     }
 
     if !config.enabled || config.endpoint.trim().is_empty() || config.model.trim().is_empty() {
+        log::info!(
+            "Problem set analysis using local fallback: title={}, problems={}, ai_enabled={}, endpoint_present={}, model_present={}",
+            title,
+            problems.len(),
+            config.enabled,
+            !config.endpoint.trim().is_empty(),
+            !config.model.trim().is_empty()
+        );
         let _ = sender.send(AnalysisStreamEvent::TextDelta(local_problem_set_analysis(
             &title, &problems,
         )));
@@ -302,6 +355,10 @@ pub fn stream_problem_set_analysis_tool(
 
     if let Err(err) = analyze_problem_set_with_tools_streaming(&config, &title, &problems, &sender)
     {
+        log::error!(
+            "Problem set streaming analysis failed: title={title}, problems={}, error={err}",
+            problems.len()
+        );
         let fallback = format!(
             "AI 请求失败，已切换为本地分析。\n\n失败原因：{}\n\n{}",
             err,
@@ -319,14 +376,20 @@ pub fn analyze_learning_gaps(
     records: &[AnswerRecord],
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
     if records.is_empty() {
+        log::info!("Learning gap analysis skipped: no records, title={title}");
         return Ok("还没有这个范围内的答题记录。先刷一轮，再分析薄弱点会更准。".into());
     }
 
     if !config.enabled {
+        log::info!(
+            "Learning gap analysis using local fallback: title={title}, records={}",
+            records.len()
+        );
         return Ok(local_learning_gap_analysis(title, records));
     }
 
     if config.endpoint.trim().is_empty() || config.model.trim().is_empty() {
+        log::warn!("Learning gap analysis skipped: endpoint/model missing, title={title}");
         return Ok("AI 薄弱点分析需要先启用并填写 endpoint/model。".into());
     }
 
@@ -359,10 +422,12 @@ pub fn continue_analysis_chat(
     user_message: &str,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
     if user_message.trim().is_empty() {
+        log::info!("Analysis chat skipped: empty user message, title={title}");
         return Ok("请输入要追问的内容。".into());
     }
 
     if !config.enabled {
+        log::info!("Analysis chat skipped: AI disabled, title={title}");
         return Ok(format!(
             "当前未启用 AI，无法继续追问。\n\n当前分析对象：{title}\n你的问题：{}\n\n可启用 AI 配置后继续对话。",
             user_message.trim()
@@ -370,6 +435,7 @@ pub fn continue_analysis_chat(
     }
 
     if config.endpoint.trim().is_empty() || config.model.trim().is_empty() {
+        log::warn!("Analysis chat skipped: endpoint/model missing, title={title}");
         return Ok("继续对话需要先启用并填写 endpoint/model。".into());
     }
 
@@ -409,6 +475,7 @@ fn build_review_prompt(problem: &Problem, user_answer: &str) -> String {
 
 fn send_prompt(config: &AiConfig, prompt: String) -> Result<String, Box<dyn Error + Send + Sync>> {
     let body = build_ai_request_body(config, prompt)?;
+    let started = log_ai_request_start("send_prompt", config, &body, false);
     let mut req = minreq::post(&config.endpoint)
         .with_header("content-type", "application/json")
         .with_timeout(config.timeout_secs)
@@ -418,8 +485,20 @@ fn send_prompt(config: &AiConfig, prompt: String) -> Result<String, Box<dyn Erro
         req = req.with_header("authorization", format!("Bearer {}", config.api_key.trim()));
     }
 
-    let response = req.send()?;
+    let response = match req.send() {
+        Ok(response) => response,
+        Err(err) => {
+            log_ai_transport_error("send_prompt", started, &err);
+            return Err(err.into());
+        }
+    };
     if response.status_code < 200 || response.status_code >= 300 {
+        log_ai_response(
+            "send_prompt",
+            started,
+            response.status_code,
+            response.as_str().ok(),
+        );
         return Err(format_ai_http_error(
             response.status_code,
             &config.endpoint,
@@ -429,6 +508,7 @@ fn send_prompt(config: &AiConfig, prompt: String) -> Result<String, Box<dyn Erro
     }
 
     let text = response.as_str()?;
+    log_ai_response("send_prompt", started, response.status_code, Some(text));
     extract_explanation(text)
         .or_else(|| Some(text.to_string()))
         .ok_or_else(|| "AI 响应为空".into())
@@ -438,6 +518,7 @@ fn send_chat_messages(
     config: &AiConfig,
     messages: Vec<ChatCompletionMessage<'_>>,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let message_count = messages.len();
     let body = if uses_chat_completions(&config.endpoint) {
         serde_json::to_string(&ChatCompletionRequest {
             model: &config.model,
@@ -455,6 +536,8 @@ fn send_chat_messages(
             prompt,
         })?
     };
+    let started = log_ai_request_start("send_chat_messages", config, &body, false);
+    log::info!("AI chat request metadata: kind=send_chat_messages, message_count={message_count}");
 
     let mut req = minreq::post(&config.endpoint)
         .with_header("content-type", "application/json")
@@ -465,8 +548,20 @@ fn send_chat_messages(
         req = req.with_header("authorization", format!("Bearer {}", config.api_key.trim()));
     }
 
-    let response = req.send()?;
+    let response = match req.send() {
+        Ok(response) => response,
+        Err(err) => {
+            log_ai_transport_error("send_chat_messages", started, &err);
+            return Err(err.into());
+        }
+    };
     if response.status_code < 200 || response.status_code >= 300 {
+        log_ai_response(
+            "send_chat_messages",
+            started,
+            response.status_code,
+            response.as_str().ok(),
+        );
         return Err(format_ai_http_error(
             response.status_code,
             &config.endpoint,
@@ -476,6 +571,12 @@ fn send_chat_messages(
     }
 
     let text = response.as_str()?;
+    log_ai_response(
+        "send_chat_messages",
+        started,
+        response.status_code,
+        Some(text),
+    );
     extract_explanation(text)
         .or_else(|| Some(text.to_string()))
         .ok_or_else(|| "AI 响应为空".into())
@@ -497,21 +598,35 @@ fn send_chat_messages_streaming(
         messages,
         stream: true,
     })?;
+    let started = log_ai_request_start("send_chat_messages_streaming", config, &body, true);
     let agent = ureq::Agent::config_builder()
         .timeout_global(Some(std::time::Duration::from_secs(
             config.timeout_secs.max(30),
         )))
         .build()
         .new_agent();
-    let mut request = agent
+    let mut request = match agent
         .post(&config.endpoint)
         .header("content-type", "application/json")
         .header("accept", "text/event-stream")
-        .send(body)?;
+        .send(body)
+    {
+        Ok(response) => response,
+        Err(err) => {
+            log_ai_transport_error("send_chat_messages_streaming", started, &err);
+            return Err(err.into());
+        }
+    };
 
     let status = request.status();
     if !status.is_success() {
         let body = request.body_mut().read_to_string().ok();
+        log_ai_response(
+            "send_chat_messages_streaming",
+            started,
+            status.as_u16() as i32,
+            body.as_deref(),
+        );
         return Err(format_ai_http_error(
             status.as_u16() as i32,
             &config.endpoint,
@@ -540,6 +655,12 @@ fn send_chat_messages_streaming(
         }
     }
 
+    log_ai_response(
+        "send_chat_messages_streaming",
+        started,
+        status.as_u16() as i32,
+        Some(&full),
+    );
     Ok(full)
 }
 
@@ -619,9 +740,22 @@ fn analyze_problem_set_with_tools(
     for _ in 0..8 {
         let response = send_chat_messages(config, clone_chat_messages(&messages))?;
         let Some(request) = parse_problem_set_tool_request(&response) else {
+            log::info!(
+                "Problem set tool analysis finished without further tool call: title={}, messages={}",
+                title,
+                messages.len()
+            );
             return Ok(response);
         };
 
+        log::info!(
+            "Problem set tool request parsed: title={}, tool={}, cursor={}, limit={}, id_present={}",
+            title,
+            request.tool,
+            request.cursor,
+            request.limit,
+            request.id.is_some()
+        );
         let tool_result = execute_problem_set_tool(problems, &request)?;
         messages.push(ChatCompletionMessage {
             role: "assistant",
@@ -656,11 +790,24 @@ fn analyze_problem_set_with_tools_streaming(
     for _ in 0..8 {
         let response = send_chat_messages(config, clone_chat_messages(&messages))?;
         let Some(request) = parse_problem_set_tool_request(&response) else {
+            log::info!(
+                "Problem set streaming tool analysis finished without further tool call: title={}, messages={}",
+                title,
+                messages.len()
+            );
             let _ = sender.send(AnalysisStreamEvent::TextDelta(response));
             let _ = sender.send(AnalysisStreamEvent::Finished);
             return Ok(());
         };
 
+        log::info!(
+            "Problem set streaming tool request parsed: title={}, tool={}, cursor={}, limit={}, id_present={}",
+            title,
+            request.tool,
+            request.cursor,
+            request.limit,
+            request.id.is_some()
+        );
         let tool_result = execute_problem_set_tool(problems, &request)?;
         messages.push(ChatCompletionMessage {
             role: "assistant",
@@ -999,6 +1146,45 @@ fn local_review(problem: &Problem, user_answer: &str) -> String {
 
 fn default_timeout_secs() -> u64 {
     30
+}
+
+fn log_ai_request_start(kind: &str, config: &AiConfig, body: &str, stream: bool) -> Instant {
+    log::info!(
+        "AI request start: kind={}, endpoint={}, model={}, timeout_secs={}, stream={}, body_chars={}, body_preview={}",
+        kind,
+        logging::redact_url(&config.endpoint),
+        logging::summarize_text(&config.model, 120),
+        config.timeout_secs,
+        stream,
+        body.chars().count(),
+        logging::redact_json_text(body, 1200)
+    );
+    Instant::now()
+}
+
+fn log_ai_response(kind: &str, started: Instant, status_code: i32, response_body: Option<&str>) {
+    let elapsed_ms = started.elapsed().as_millis();
+    let body_chars = response_body.map(|body| body.chars().count()).unwrap_or(0);
+    let preview = response_body
+        .map(|body| logging::redact_json_text(body, 1200))
+        .unwrap_or_default();
+    log::info!(
+        "AI request finish: kind={}, status_code={}, elapsed_ms={}, response_chars={}, response_preview={}",
+        kind,
+        status_code,
+        elapsed_ms,
+        body_chars,
+        preview
+    );
+}
+
+fn log_ai_transport_error(kind: &str, started: Instant, err: &dyn std::fmt::Display) {
+    log::error!(
+        "AI request transport error: kind={}, elapsed_ms={}, error={}",
+        kind,
+        started.elapsed().as_millis(),
+        logging::summarize_text(&err.to_string(), 500)
+    );
 }
 
 #[cfg(test)]
