@@ -91,7 +91,7 @@ fn write_response(
     };
     let headers = format!(
         "HTTP/1.1 {status}\r\n{extra_headers}Content-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
-        body.as_bytes().len()
+        body.len()
     );
     stream.write_all(headers.as_bytes())?;
     stream.write_all(body.as_bytes())?;
