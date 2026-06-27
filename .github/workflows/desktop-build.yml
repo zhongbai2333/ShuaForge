@@ -66,6 +66,17 @@ jobs:
               with:
                   targets: ${{ matrix.target }}
 
+            - name: Install Node.js
+              uses: actions/setup-node@v4
+              with:
+                  node-version: 22
+                  cache: npm
+
+            - name: Build embedded userscript
+              run: |
+                  npm ci
+                  npm run build:userscript
+
             - name: Install Linux dependencies
               if: runner.os == 'Linux'
               run: |
