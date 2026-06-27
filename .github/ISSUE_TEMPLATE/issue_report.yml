@@ -1,0 +1,100 @@
+name: "Issue 报告"
+description: 反馈 Bug / 使用问题 / 题库导入或油猴脚本建议
+title: "[Issue] "
+labels: ["NEW"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈！为了更快定位问题，请尽量提供：
+        - **ShuaForge 版本**（Release 版本号或 commit）
+        - **操作系统**（Windows / Linux / macOS）
+        - **问题场景**（桌面端、题库导入、AI 解析、油猴脚本导出等）
+        - **示例题库 / CSV / JSON / 页面截图**（如涉及导入或识别问题，请脱敏后附上）
+
+        > 如果问题涉及 AI，请勿上传真实 API Key；请只保留 endpoint/model/错误信息。
+
+  - type: dropdown
+    id: issue_type
+    attributes:
+      label: 问题类型
+      description: 请选择最接近的类型
+      options:
+        - Bug（功能异常/崩溃/报错）
+        - Question（使用疑问）
+        - Enhancement（功能建议）
+        - Documentation（文档问题）
+    validations:
+      required: true
+
+  - type: dropdown
+    id: affected_area
+    attributes:
+      label: 影响范围
+      description: 问题主要发生在哪一部分？
+      options:
+        - 桌面端刷题 / 题库管理
+        - 题库导入（JSON / CSV）
+        - 油猴脚本导出器
+        - AI 解析 / AI 配置
+        - 构建 / 发布 / 安装
+        - 文档 / 示例
+        - 其他
+    validations:
+      required: true
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: 问题描述
+      description: 发生了什么？你期望的结果是什么？
+      placeholder: |
+        例如：导入 CSV 后多选题被识别成文本题，期望识别为多选并显示 Checkbox。
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce_steps
+    attributes:
+      label: 复现步骤（可选但建议）
+      description: 尽量按步骤描述，方便快速复现
+      placeholder: |
+        1. 打开 ShuaForge
+        2. 导入某个 CSV / JSON
+        3. 点击某个题库开始练习
+        4. 观察到的问题：
+    validations:
+      required: false
+
+  - type: input
+    id: env_info
+    attributes:
+      label: 环境信息（可选但建议）
+      description: 操作系统、程序版本、运行方式等
+      placeholder: 例如：Windows 11 / v0.1.1 / Release exe
+    validations:
+      required: false
+
+  - type: textarea
+    id: sample_data
+    attributes:
+      label: 示例数据 / 页面信息（可选）
+      description: 如涉及题库导入或油猴脚本识别，请附脱敏后的 CSV / JSON 片段、平台页面截图或 DOM 特征。
+      placeholder: |
+        - 已附示例文件：是/否
+        - 题库格式：CSV / JSON
+        - 油猴脚本目标平台：
+        - 其他补充：
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志与报错（可选）
+      description: 可粘贴终端输出、错误弹窗、AI 接口错误等。请勿包含 API Key 或隐私信息。
+      placeholder: |
+        关键报错：
+        其他补充：
+    validations:
+      required: false
