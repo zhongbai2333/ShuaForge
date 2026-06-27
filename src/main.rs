@@ -2,7 +2,9 @@ mod ai;
 mod app;
 mod deck;
 mod problem;
+mod self_update;
 mod store;
+mod userscript_server;
 
 use app::ShuaForgeApp;
 

@@ -6,7 +6,9 @@ use crate::{
     },
     deck::{PracticeDeck, PracticeOrder, SubmitResult},
     problem::{Problem, ProblemType, load_problems, normalize_choice_answer},
+    self_update::{self, UpdateInfo, UpdateOutcome},
     store::{AnswerRecord, AppStore, DeckCard, GroupCard},
+    userscript_server,
 };
 use eframe::egui::{self, FontData, FontDefinitions, FontFamily};
 use serde::{Deserialize, Serialize};
@@ -113,6 +115,23 @@ struct AnalysisStreamResponse {
 struct ChatAsyncResponse {
     generation_id: u64,
     message: String,
+}
+
+#[derive(Debug, Clone)]
+enum UpdateAsyncResponse {
+    CheckFinished(Result<Option<UpdateInfo>, String>),
+    ApplyFinished(Result<UpdateOutcome, String>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdateCheckSource {
+    Startup,
+    Manual,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct PersistedUpdateSettings {
+    ignored_tag: Option<String>,
 }
 
 impl AnalysisDialogState {
@@ -227,12 +246,107 @@ impl From<PersistedPracticeOrder> for PracticeOrder {
 }
 
 const SETTINGS_KEY: &str = "app_settings";
+const UPDATE_SETTINGS_KEY: &str = "update_settings";
 const ANALYSIS_CACHE_KEY: &str = "analysis_dialog_cache";
 const ANALYSIS_TEXT_CACHE_KEY: &str = "analysis_text_cache";
 const CARD_WIDTH: f32 = 300.0;
 const GROUP_CARD_HEIGHT: f32 = 158.0;
 const DECK_CARD_HEIGHT: f32 = 188.0;
 const CARD_BUTTON_WIDTH: f32 = 76.0;
+
+struct ThirdPartyLicense {
+    name: &'static str,
+    license: &'static str,
+    url: &'static str,
+}
+
+const THIRD_PARTY_LICENSES: &[ThirdPartyLicense] = &[
+    ThirdPartyLicense {
+        name: "base64",
+        license: "MIT OR Apache-2.0",
+        url: "https://github.com/marshallpierce/rust-base64",
+    },
+    ThirdPartyLicense {
+        name: "csv",
+        license: "Unlicense/MIT",
+        url: "https://github.com/BurntSushi/rust-csv",
+    },
+    ThirdPartyLicense {
+        name: "dirs",
+        license: "MIT OR Apache-2.0",
+        url: "https://github.com/soc/dirs-rs",
+    },
+    ThirdPartyLicense {
+        name: "eframe / egui",
+        license: "MIT OR Apache-2.0",
+        url: "https://github.com/emilk/egui",
+    },
+    ThirdPartyLicense {
+        name: "hex",
+        license: "MIT OR Apache-2.0",
+        url: "https://github.com/KokaKiwi/rust-hex",
+    },
+    ThirdPartyLicense {
+        name: "minreq",
+        license: "ISC",
+        url: "https://github.com/neonmoe/minreq",
+    },
+    ThirdPartyLicense {
+        name: "rand",
+        license: "MIT OR Apache-2.0",
+        url: "https://github.com/rust-random/rand",
+    },
+    ThirdPartyLicense {
+        name: "rfd",
+        license: "MIT",
+        url: "https://github.com/PolyMeilex/rfd",
+    },
+    ThirdPartyLicense {
+        name: "rusqlite",
+        license: "MIT",
+        url: "https://github.com/rusqlite/rusqlite",
+    },
+    ThirdPartyLicense {
+        name: "serde",
+        license: "MIT OR Apache-2.0",
+        url: "https://github.com/serde-rs/serde",
+    },
+    ThirdPartyLicense {
+        name: "serde_json",
+        license: "MIT OR Apache-2.0",
+        url: "https://github.com/serde-rs/json",
+    },
+    ThirdPartyLicense {
+        name: "sha2",
+        license: "MIT OR Apache-2.0",
+        url: "https://github.com/RustCrypto/hashes",
+    },
+    ThirdPartyLicense {
+        name: "tempfile",
+        license: "MIT OR Apache-2.0",
+        url: "https://github.com/Stebalien/tempfile",
+    },
+    ThirdPartyLicense {
+        name: "ureq",
+        license: "MIT OR Apache-2.0",
+        url: "https://github.com/algesten/ureq",
+    },
+    ThirdPartyLicense {
+        name: "webbrowser",
+        license: "MIT OR Apache-2.0",
+        url: "https://github.com/amodm/webbrowser-rs",
+    },
+    ThirdPartyLicense {
+        name: "zip",
+        license: "MIT",
+        url: "https://github.com/zip-rs/zip2.git",
+    },
+    ThirdPartyLicense {
+        name: "TypeScript",
+        license: "Apache-2.0",
+        url: "https://github.com/microsoft/TypeScript",
+    },
+];
 
 pub struct ShuaForgeApp {
     deck: Option<PracticeDeck>,
@@ -250,6 +364,14 @@ pub struct ShuaForgeApp {
     analysis_receiver: Option<mpsc::Receiver<AnalysisAsyncResponse>>,
     analysis_stream_receiver: Option<mpsc::Receiver<AnalysisStreamResponse>>,
     chat_receiver: Option<mpsc::Receiver<ChatAsyncResponse>>,
+    update_receiver: Option<mpsc::Receiver<UpdateAsyncResponse>>,
+    update_info: Option<UpdateInfo>,
+    update_status: String,
+    is_update_checking: bool,
+    is_update_applying: bool,
+    update_check_source: Option<UpdateCheckSource>,
+    show_update_prompt: bool,
+    ignored_update_tag: Option<String>,
     analysis_generation_id: u64,
     analysis_dialog: Option<AnalysisDialogState>,
     analysis_cache: HashMap<AnalysisCacheKey, AnalysisDialogState>,
@@ -262,6 +384,7 @@ pub struct ShuaForgeApp {
     active_deck_name: Option<String>,
     answer_history: Vec<AnswerRecord>,
     bank_count: usize,
+    show_about: bool,
     new_group_name: String,
     dragging_deck_id: Option<i64>,
     dragging_group_id: Option<i64>,
@@ -287,6 +410,10 @@ impl ShuaForgeApp {
             .unwrap_or_default();
         let theme = AppTheme::from(settings.theme);
         let practice_order = PracticeOrder::from(settings.practice_order);
+        let update_settings = store
+            .as_ref()
+            .and_then(|store| load_persisted_update_settings(store).ok())
+            .unwrap_or_default();
         cc.egui_ctx.set_visuals(theme.visuals());
 
         let mut app = Self {
@@ -305,6 +432,14 @@ impl ShuaForgeApp {
             analysis_receiver: None,
             analysis_stream_receiver: None,
             chat_receiver: None,
+            update_receiver: None,
+            update_info: None,
+            update_status: "尚未检查更新。".into(),
+            is_update_checking: false,
+            is_update_applying: false,
+            update_check_source: None,
+            show_update_prompt: false,
+            ignored_update_tag: update_settings.ignored_tag,
             analysis_generation_id: 0,
             analysis_dialog: None,
             analysis_cache: HashMap::new(),
@@ -317,6 +452,7 @@ impl ShuaForgeApp {
             active_deck_name: None,
             answer_history: Vec::new(),
             bank_count: 0,
+            show_about: false,
             new_group_name: "新题组".into(),
             dragging_deck_id: None,
             dragging_group_id: None,
@@ -324,6 +460,7 @@ impl ShuaForgeApp {
         app.load_analysis_cache();
         app.load_analysis_text_cache();
         app.refresh_store_state();
+        app.start_update_check(UpdateCheckSource::Startup);
         app
     }
 
@@ -355,10 +492,139 @@ impl ShuaForgeApp {
         }
     }
 
-    fn theme_button_text(&self) -> &'static str {
+    fn theme_button_icon(&self) -> &'static str {
         match self.theme {
-            AppTheme::Dark => "切换浅色",
-            AppTheme::Light => "切换深色",
+            AppTheme::Dark => "☀",
+            AppTheme::Light => "🌙",
+        }
+    }
+
+    fn theme_button_tooltip(&self) -> &'static str {
+        match self.theme {
+            AppTheme::Dark => "切换到浅色主题",
+            AppTheme::Light => "切换到深色主题",
+        }
+    }
+
+    fn open_url(&mut self, url: &str) {
+        if let Err(err) = webbrowser::open(url) {
+            self.status = format!("打开链接失败：{err}");
+        }
+    }
+
+    fn start_update_check(&mut self, source: UpdateCheckSource) {
+        if self.is_update_checking || self.is_update_applying {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        self.update_receiver = Some(receiver);
+        self.is_update_checking = true;
+        self.update_check_source = Some(source);
+        self.update_status = "正在检查更新...".into();
+        thread::spawn(move || {
+            let result = self_update::check_latest_version().map_err(|err| err.to_string());
+            let _ = sender.send(UpdateAsyncResponse::CheckFinished(result));
+        });
+    }
+
+    fn start_apply_update(&mut self) {
+        if self.is_update_applying {
+            return;
+        }
+        self.show_update_prompt = false;
+        self.is_update_applying = true;
+        self.update_status = "正在下载并应用更新...".into();
+        let (sender, receiver) = mpsc::channel();
+        self.update_receiver = Some(receiver);
+        thread::spawn(move || {
+            let result = self_update::perform_update(None).map_err(|err| err.to_string());
+            let _ = sender.send(UpdateAsyncResponse::ApplyFinished(result));
+        });
+    }
+
+    fn ignore_current_update(&mut self) {
+        let Some(info) = &self.update_info else {
+            self.show_update_prompt = false;
+            return;
+        };
+        self.ignored_update_tag = Some(info.tag_name.clone());
+        self.show_update_prompt = false;
+        self.update_status = format!("已忽略版本 {}。", info.tag_name);
+        self.persist_update_settings();
+    }
+
+    fn persist_update_settings(&mut self) {
+        let Some(store) = &self.store else { return };
+        let Ok(value) = serde_json::to_string_pretty(&PersistedUpdateSettings {
+            ignored_tag: self.ignored_update_tag.clone(),
+        }) else {
+            self.status = "更新设置序列化失败。".into();
+            return;
+        };
+        if let Err(err) = store.set_setting(UPDATE_SETTINGS_KEY, &value) {
+            self.status = format!("更新设置保存失败：{err}");
+        }
+    }
+
+    fn poll_update(&mut self) {
+        let Some(receiver) = &self.update_receiver else {
+            return;
+        };
+        let Ok(response) = receiver.try_recv() else {
+            return;
+        };
+        self.update_receiver = None;
+        match response {
+            UpdateAsyncResponse::CheckFinished(result) => {
+                self.is_update_checking = false;
+                let source = self
+                    .update_check_source
+                    .take()
+                    .unwrap_or(UpdateCheckSource::Manual);
+                match result {
+                    Ok(Some(info)) => {
+                        let ignored = self.ignored_update_tag.as_deref() == Some(&info.tag_name);
+                        self.update_status = format!(
+                            "发现新版本 {}（当前 {}）。",
+                            info.tag_name,
+                            self_update::current_tag()
+                        );
+                        self.update_info = Some(info);
+                        self.show_update_prompt = !ignored || source == UpdateCheckSource::Manual;
+                    }
+                    Ok(None) => {
+                        self.update_info = None;
+                        self.show_update_prompt = false;
+                        self.update_status =
+                            format!("已是最新版本 {}。", self_update::current_tag());
+                    }
+                    Err(err) => {
+                        self.update_status = format!("检查更新失败：{err}");
+                        if source == UpdateCheckSource::Manual {
+                            self.status = self.update_status.clone();
+                        }
+                    }
+                }
+            }
+            UpdateAsyncResponse::ApplyFinished(result) => {
+                self.is_update_applying = false;
+                match result {
+                    Ok(UpdateOutcome::UpToDate) => {
+                        self.update_status = "已是最新版本。".into();
+                    }
+                    Ok(UpdateOutcome::Skipped) => {
+                        self.update_status =
+                            "开发构建或当前环境不适合自动替换，已跳过更新。".into();
+                    }
+                    Ok(UpdateOutcome::UpdateLaunched) => {
+                        self.update_status = "更新流程已启动，请按提示完成。".into();
+                    }
+                    Err(err) => {
+                        self.update_status = format!("更新失败：{err}");
+                    }
+                }
+                self.status = self.update_status.clone();
+            }
         }
     }
 
@@ -1493,6 +1759,124 @@ impl ShuaForgeApp {
         }
     }
 
+    fn render_about_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_about {
+            return;
+        }
+
+        let mut open = self.show_about;
+        egui::Window::new("关于")
+            .open(&mut open)
+            .default_width(420.0)
+            .default_height(560.0)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(8.0);
+                    ui.heading("ShuaForge");
+                    ui.label("轻量 Rust 桌面刷题助手");
+                    ui.add_space(4.0);
+                    ui.label(format!("v{}", env!("CARGO_PKG_VERSION")));
+                    ui.small("作者：ShuaForge contributors");
+                    ui.add_space(8.0);
+
+                    if ui.button("GitHub 仓库").clicked() {
+                        self.open_url("https://github.com/zhongbai2333/ShuaForge");
+                    }
+                    ui.small("许可证：MIT License");
+                });
+
+                ui.separator();
+                ui.heading("更新");
+                ui.label(&self.update_status);
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(
+                            !self.is_update_checking && !self.is_update_applying,
+                            egui::Button::new("检查更新"),
+                        )
+                        .clicked()
+                    {
+                        self.start_update_check(UpdateCheckSource::Manual);
+                    }
+                    if self.update_info.is_some()
+                        && ui
+                            .add_enabled(
+                                !self.is_update_checking && !self.is_update_applying,
+                                egui::Button::new("立即更新"),
+                            )
+                            .clicked()
+                    {
+                        self.start_apply_update();
+                    }
+                });
+
+                ui.separator();
+                ui.heading("开源许可");
+                ui.small("以下为 ShuaForge 直接使用的第三方库及其包元数据声明的许可证。");
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("about_license_scroll")
+                    .max_height(250.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for notice in THIRD_PARTY_LICENSES {
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new(notice.name).strong());
+                                ui.small(format!("({})", notice.license));
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui.small_button("查看").clicked() {
+                                            self.open_url(notice.url);
+                                        }
+                                    },
+                                );
+                            });
+                        }
+                    });
+            });
+
+        self.show_about = open && self.show_about;
+    }
+
+    fn render_update_prompt(&mut self, ctx: &egui::Context) {
+        if !self.show_update_prompt {
+            return;
+        }
+
+        let Some(info) = self.update_info.clone() else {
+            self.show_update_prompt = false;
+            return;
+        };
+        let title = format!("发现新版本 {}", info.tag_name);
+        egui::Window::new("发现更新")
+            .collapsible(false)
+            .resizable(false)
+            .default_width(420.0)
+            .show(ctx, |ui| {
+                ui.heading(title);
+                ui.label(format!("当前版本：{}", self_update::current_tag()));
+                ui.label(format!("最新版本：{}", info.tag_name));
+                if !info.release_name.trim().is_empty() {
+                    ui.small(format!("Release：{}", info.release_name));
+                }
+                ui.small(format!("资产：{}", info.asset_name));
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(!self.is_update_applying, egui::Button::new("更新"))
+                        .clicked()
+                    {
+                        self.start_apply_update();
+                    }
+                    if ui.button("此版本不再提醒").clicked() {
+                        self.ignore_current_update();
+                    }
+                });
+            });
+    }
+
     fn send_analysis_chat_message(&mut self) {
         let (title, latest_result, input) = {
             let Some(dialog) = &mut self.analysis_dialog else {
@@ -1920,50 +2304,48 @@ fn load_persisted_settings(
     Ok(serde_json::from_str(&value)?)
 }
 
+fn load_persisted_update_settings(
+    store: &AppStore,
+) -> Result<PersistedUpdateSettings, Box<dyn std::error::Error + Send + Sync>> {
+    let Some(value) = store.get_setting(UPDATE_SETTINGS_KEY)? else {
+        return Ok(PersistedUpdateSettings::default());
+    };
+    Ok(serde_json::from_str(&value)?)
+}
+
 impl eframe::App for ShuaForgeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_ai();
+        self.poll_update();
         if self.is_ai_loading {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        if self.is_update_checking || self.is_update_applying {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         if self.dragging_deck_id.is_some() || self.dragging_group_id.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
         self.render_analysis_dialog(ctx);
+        self.render_about_dialog(ctx);
+        self.render_update_prompt(ctx);
 
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.heading("ShuaForge");
                 ui.label("轻量 Rust 刷题助手");
-                ui.separator();
-
-                if ui.button("导入题库").clicked() {
-                    self.import_problem_bank();
-                }
-                if ui.button("题库主页").clicked() {
-                    self.back_to_library();
-                }
-                if ui.button("练习全部题库").clicked() {
-                    self.restart_from_store();
-                }
-                let mut shuffled = self.practice_order == PracticeOrder::Shuffled;
-                if ui.checkbox(&mut shuffled, "乱序").changed() {
-                    self.practice_order = if shuffled {
-                        PracticeOrder::Shuffled
-                    } else {
-                        PracticeOrder::Sequential
-                    };
-                    self.status = if shuffled {
-                        "已切换为乱序练习。"
-                    } else {
-                        "已切换为顺序练习。"
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .button(self.theme_button_icon())
+                        .on_hover_text(self.theme_button_tooltip())
+                        .clicked()
+                    {
+                        self.toggle_theme(ctx);
                     }
-                    .into();
-                    self.persist_settings();
-                }
-                if ui.button(self.theme_button_text()).clicked() {
-                    self.toggle_theme(ctx);
-                }
+                    if ui.button("关于").clicked() {
+                        self.show_about = true;
+                    }
+                });
             });
         });
 
@@ -1976,6 +2358,24 @@ impl eframe::App for ShuaForgeApp {
                         .id_salt("config_panel_scroll")
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
+                            ui.heading("练习设置");
+                            let mut shuffled = self.practice_order == PracticeOrder::Shuffled;
+                            if ui.checkbox(&mut shuffled, "乱序练习").changed() {
+                                self.practice_order = if shuffled {
+                                    PracticeOrder::Shuffled
+                                } else {
+                                    PracticeOrder::Sequential
+                                };
+                                self.status = if shuffled {
+                                    "已切换为乱序练习。"
+                                } else {
+                                    "已切换为顺序练习。"
+                                }
+                                .into();
+                                self.persist_settings();
+                            }
+
+                            ui.separator();
                             ui.heading("AI 配置");
                             ui.horizontal_wrapped(|ui| {
                                 if ui.button("导入 JSON").clicked() {
@@ -2032,6 +2432,24 @@ impl eframe::App for ShuaForgeApp {
                             if let Some(path) = &self.ai_config_path {
                                 ui.small(format!("AI 配置：{}", path.display()));
                             }
+
+                            ui.separator();
+                            ui.heading("浏览器导出脚本");
+                            if ui.button("安装题库导出油猴脚本").clicked() {
+                                match userscript_server::open_userscript_install_page() {
+                                    Ok(url) => {
+                                        self.status = format!(
+                                            "已在浏览器打开脚本安装页：{url}。如果没有弹出安装页，请确认已安装 Tampermonkey / Violentmonkey / 脚本猫。"
+                                        );
+                                    }
+                                    Err(err) => {
+                                        self.status = err;
+                                    }
+                                }
+                            }
+                            ui.small(
+                                "会启动本机 127.0.0.1 临时服务并打开 .user.js 安装页；浏览器扩展仍需要你确认安装。",
+                            );
 
                             ui.collapsing("答题历史", |ui| {
                                 for record in &self.answer_history {
