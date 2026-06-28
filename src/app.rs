@@ -3,7 +3,7 @@ use crate::{
         AiConfig, AnalysisStreamEvent, AnalysisToolResult,
         annotate_problem_knowledge_points_with_progress, call_learning_gap_analysis_tool,
         continue_analysis_chat, explain_wrong_answer, guide_solution_process, load_ai_config,
-        review_answer, save_ai_config, stream_problem_set_analysis_tool,
+        review_pending_problems_with_progress, save_ai_config, stream_problem_set_analysis_tool,
     },
     ai_import::{AiImportResult, import_problem_bank_with_ai},
     deck::{PracticeDeck, PracticeDeckSnapshot, PracticeOrder, SubmitResult},
@@ -1199,13 +1199,11 @@ impl ShuaForgeApp {
         };
 
         if problem.needs_ai_review() {
-            deck.mark_current_wrong_and_advance();
-            self.record_answer(&problem, &user_answer, false);
-            self.status = "该题没有标准答案，已交给 AI 批改，并重新插回题库继续复习。".into();
-            self.analysis = "AI 批改中...".into();
-            self.request_ai_review(problem, user_answer);
-            self.clear_answer_inputs();
-            self.guided_problem_id = None;
+            self.status = "该题尚未完成 AI 复核，暂不判题也不计错。请回到题库主页点击“AI分析”，统一复核后再练习。".into();
+            self.analysis = format!(
+                "这道题缺少可靠标准答案，当前答案不会被判错。\n\n你的输入：{}\n\n建议先对所在题库/题组运行 AI 分析；分析阶段会统一复核待复核题目，并把可确认的标准答案保存到题库。",
+                user_answer.trim()
+            );
             self.persist_current_practice_session();
             self.refresh_store_state();
             return;
@@ -1289,21 +1287,6 @@ impl ShuaForgeApp {
             let message = match explain_wrong_answer(&config, &problem, &user_answer) {
                 Ok(text) => text,
                 Err(err) => format!("AI 解析失败：{err}"),
-            };
-            let _ = sender.send(message);
-        });
-    }
-
-    fn request_ai_review(&mut self, problem: Problem, user_answer: String) {
-        let config = self.ai_config.clone();
-        let (sender, receiver) = mpsc::channel();
-        self.ai_receiver = Some(receiver);
-        self.is_ai_loading = true;
-
-        thread::spawn(move || {
-            let message = match review_answer(&config, &problem, &user_answer) {
-                Ok(text) => text,
-                Err(err) => format!("AI 批改失败：{err}"),
             };
             let _ = sender.send(message);
         });
@@ -1463,6 +1446,19 @@ impl ShuaForgeApp {
                     }
                 }
             });
+            let review_progress_sender = event_sender.clone();
+            let problems = review_pending_problems_with_progress(
+                &config,
+                problems,
+                Some(&move |current, total| {
+                    let _ = review_progress_sender.send(AnalysisStreamEvent::Progress {
+                        label: "AI 统一复核待复核题目".into(),
+                        current,
+                        total,
+                    });
+                }),
+            );
+            let _ = event_sender.send(AnalysisStreamEvent::ReviewCompleted(problems.clone()));
             let progress_sender = event_sender.clone();
             let problems = annotate_problem_knowledge_points_with_progress(
                 &config,
@@ -1538,6 +1534,73 @@ impl ShuaForgeApp {
             let _ = sender.send(AnalysisStreamResponse {
                 generation_id,
                 event: AnalysisStreamEvent::KnowledgePointsAnnotated(problems),
+            });
+            let _ = sender.send(AnalysisStreamResponse {
+                generation_id,
+                event: AnalysisStreamEvent::Finished,
+            });
+        });
+    }
+
+    fn start_ai_review_check(&mut self) {
+        let Some(dialog) = &self.analysis_dialog else {
+            return;
+        };
+        if dialog.is_loading || dialog.kind != AnalysisKind::ProblemSet {
+            return;
+        }
+        let key = AnalysisCacheKey {
+            kind: dialog.kind,
+            title: dialog.title.clone(),
+        };
+        let Some(AnalysisSource::Problems(problems)) = self.analysis_sources.get(&key).cloned()
+        else {
+            self.status = "当前对话缺少原始题目，无法执行 AI 核查。".into();
+            return;
+        };
+
+        let pending_count = problems
+            .iter()
+            .filter(|problem| problem.needs_ai_review())
+            .count();
+        if pending_count == 0 {
+            self.status = format!("{} 没有需要 AI 核查的题目。", key.title);
+            return;
+        }
+
+        let generation_id = self.next_analysis_generation();
+        let config = self.ai_config.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.analysis_stream_receiver = Some(receiver);
+        self.analysis_progress = Some(AnalysisProgressState::new(
+            "准备 AI 核查待复核题目",
+            0,
+            pending_count,
+        ));
+        self.status = format!("正在核查{}的待复核题目...", key.title);
+        if let Some(dialog) = &mut self.analysis_dialog {
+            dialog.is_loading = true;
+        }
+
+        thread::spawn(move || {
+            let progress_sender = sender.clone();
+            let problems = review_pending_problems_with_progress(
+                &config,
+                problems,
+                Some(&move |current, total| {
+                    let _ = progress_sender.send(AnalysisStreamResponse {
+                        generation_id,
+                        event: AnalysisStreamEvent::Progress {
+                            label: "AI 核查待复核题目".into(),
+                            current,
+                            total,
+                        },
+                    });
+                }),
+            );
+            let _ = sender.send(AnalysisStreamResponse {
+                generation_id,
+                event: AnalysisStreamEvent::ReviewCompleted(problems),
             });
             let _ = sender.send(AnalysisStreamResponse {
                 generation_id,
@@ -1729,6 +1792,33 @@ impl ShuaForgeApp {
                             }
                             Err(err) => {
                                 self.status = format!("AI 知识点标签保存失败：{err}");
+                            }
+                        }
+                    }
+                    if let Some(dialog) = &self.analysis_dialog {
+                        let key = AnalysisCacheKey {
+                            kind: dialog.kind,
+                            title: dialog.title.clone(),
+                        };
+                        if matches!(dialog.kind, AnalysisKind::ProblemSet) {
+                            self.analysis_sources
+                                .insert(key, AnalysisSource::Problems(problems));
+                        }
+                    }
+                }
+                AnalysisStreamEvent::ReviewCompleted(problems) => {
+                    if let Some(store) = &mut self.store {
+                        match store.update_problems_after_ai_review(&problems) {
+                            Ok(updated) if updated > 0 => {
+                                self.status =
+                                    format!("已统一复核并保存 {updated} 道题，正在继续分析...");
+                                self.refresh_store_state();
+                            }
+                            Ok(_) => {
+                                self.status = "没有需要保存的 AI 复核结果，正在继续分析...".into();
+                            }
+                            Err(err) => {
+                                self.status = format!("AI 复核结果保存失败：{err}");
                             }
                         }
                     }
@@ -2239,6 +2329,7 @@ impl ShuaForgeApp {
         let mut send_message = false;
         let mut new_dialog_requested = false;
         let mut knowledge_reanalysis_requested = false;
+        let mut ai_review_check_requested = false;
         let mut should_close = false;
         let viewport_id = egui::ViewportId::from_hash_of(("shuaforge_analysis_dialog", &key));
         let window_index = self
@@ -2282,6 +2373,13 @@ impl ShuaForgeApp {
                                     .clicked()
                             {
                                 knowledge_reanalysis_requested = true;
+                            }
+                            if dialog.kind == AnalysisKind::ProblemSet
+                                && ui
+                                    .add_enabled(!dialog.is_loading, egui::Button::new("AI核查"))
+                                    .clicked()
+                            {
+                                ai_review_check_requested = true;
                             }
                         });
                     });
@@ -2349,6 +2447,9 @@ impl ShuaForgeApp {
         }
         if knowledge_reanalysis_requested {
             self.start_knowledge_point_reanalysis();
+        }
+        if ai_review_check_requested {
+            self.start_ai_review_check();
         }
         if self
             .analysis_dialogs

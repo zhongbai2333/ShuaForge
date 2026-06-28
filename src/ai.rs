@@ -39,6 +39,7 @@ pub enum AnalysisStreamEvent {
         total: usize,
     },
     KnowledgePointsAnnotated(Vec<Problem>),
+    ReviewCompleted(Vec<Problem>),
     ToolCall {
         arguments_json: String,
     },
@@ -148,6 +149,14 @@ struct StreamDelta {
     content: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct StructuredReviewResponse {
+    verdict: Option<String>,
+    reference_answer: Option<String>,
+    explanation: Option<String>,
+    confidence: Option<String>,
+}
+
 pub fn load_ai_config(path: &Path) -> Result<AiConfig, Box<dyn Error + Send + Sync>> {
     let text = fs::read_to_string(path)?;
     Ok(serde_json::from_str(&text)?)
@@ -222,6 +231,7 @@ pub fn explain_wrong_answer(
         .ok_or_else(|| "AI 响应为空".into())
 }
 
+#[allow(dead_code)]
 pub fn review_answer(
     config: &AiConfig,
     problem: &Problem,
@@ -359,6 +369,195 @@ pub fn annotate_problem_knowledge_points_with_progress(
         callback(completed, total);
     }
     annotated
+}
+
+pub fn review_pending_problems_with_progress(
+    config: &AiConfig,
+    problems: Vec<Problem>,
+    on_progress: Option<&dyn Fn(usize, usize)>,
+) -> Vec<Problem> {
+    let pending_total = problems
+        .iter()
+        .filter(|problem| problem.needs_ai_review())
+        .count();
+    if pending_total == 0 || !config.enabled || config.endpoint.trim().is_empty() {
+        if let Some(callback) = on_progress {
+            callback(pending_total, pending_total);
+        }
+        return problems;
+    }
+
+    if config.model.trim().is_empty() {
+        if let Some(callback) = on_progress {
+            callback(pending_total, pending_total);
+        }
+        return problems;
+    }
+
+    let concurrency = config.knowledge_point_concurrency.clamp(1, 4);
+    let mut reviewed = Vec::with_capacity(problems.len());
+    let mut handles = Vec::new();
+    let mut completed = 0usize;
+
+    if let Some(callback) = on_progress {
+        callback(0, pending_total);
+    }
+
+    for problem in problems {
+        if !problem.needs_ai_review() {
+            reviewed.push(problem);
+            continue;
+        }
+
+        let task_config = config.clone();
+        let handle = std::thread::spawn(move || review_one_pending_problem(task_config, problem));
+        handles.push(handle);
+        if handles.len() >= concurrency {
+            completed += join_review_handles(&mut handles, &mut reviewed);
+            if let Some(callback) = on_progress {
+                callback(completed, pending_total);
+            }
+        }
+    }
+
+    completed += join_review_handles(&mut handles, &mut reviewed);
+    if let Some(callback) = on_progress {
+        callback(completed, pending_total);
+    }
+    reviewed
+}
+
+fn join_review_handles(
+    handles: &mut Vec<std::thread::JoinHandle<Problem>>,
+    reviewed: &mut Vec<Problem>,
+) -> usize {
+    let mut joined = 0usize;
+    for handle in std::mem::take(handles) {
+        if let Ok(problem) = handle.join() {
+            reviewed.push(problem);
+        }
+        joined += 1;
+    }
+    joined
+}
+
+fn review_one_pending_problem(config: AiConfig, mut problem: Problem) -> Problem {
+    match send_prompt(&config, build_structured_review_prompt(&problem)) {
+        Ok(text) => match parse_structured_review(&text) {
+            Some(review) => apply_structured_review(&mut problem, review),
+            None => log::warn!(
+                "AI review response could not be parsed: problem_id={}, response_chars={}",
+                problem.id,
+                text.chars().count()
+            ),
+        },
+        Err(err) => log::warn!(
+            "Pending problem AI review failed: problem_id={}, error={err}",
+            problem.id
+        ),
+    }
+    problem
+}
+
+fn apply_structured_review(problem: &mut Problem, review: StructuredReviewResponse) {
+    let verdict = review
+        .verdict
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("无法判断");
+    let confidence = review
+        .confidence
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("未知");
+    let explanation = review
+        .explanation
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("AI 已完成复核，但没有返回详细理由。");
+    let reference_answer = review
+        .reference_answer
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    if let Some(answer) = reference_answer {
+        problem.answer = match problem.kind() {
+            crate::problem::ProblemType::SingleChoice
+            | crate::problem::ProblemType::MultipleChoice => {
+                let normalized = crate::problem::normalize_choice_answer(answer);
+                if normalized.is_empty() {
+                    answer.to_owned()
+                } else {
+                    normalized
+                }
+            }
+            crate::problem::ProblemType::Text => answer.to_owned(),
+        };
+        problem.tags.retain(|tag| {
+            !matches!(
+                tag.as_str(),
+                "待复核" | "多选需复核" | "填空需复核" | "作答错误"
+            )
+        });
+        add_tag_once(&mut problem.tags, "AI复核完成");
+    } else {
+        add_tag_once(&mut problem.tags, "AI复核无法判断");
+    }
+
+    add_tag_once(&mut problem.tags, &format!("AI复核结论:{verdict}"));
+    problem.explanation = format!("AI复核结果：{verdict}\n置信度：{confidence}\n\n{explanation}");
+}
+
+fn add_tag_once(tags: &mut Vec<String>, tag: &str) {
+    if !tags.iter().any(|existing| existing == tag) {
+        tags.push(tag.to_owned());
+    }
+}
+
+fn build_structured_review_prompt(problem: &Problem) -> String {
+    format!(
+        "你是 ShuaForge 的题目复核助手，不要自称老师。页面没有提供标准答案，题库中保存的 answer 是用户历史作答，可能正确也可能错误。请根据题干、选项和历史作答复核出可用于后续自动判题的标准答案。\n\n必须只输出严格 JSON，不要 Markdown，不要代码块。\n输出格式：{{\"verdict\":\"正确/错误/无法判断\",\"reference_answer\":\"可确认的标准答案；无法确认则为空字符串\",\"explanation\":\"简要理由\",\"confidence\":\"高/中/低\"}}\n\n规则：\n1. 单选/判断题 reference_answer 只输出一个选项字母，例如 A。\n2. 多选题 reference_answer 输出全部选项字母并按字母升序排列，例如 AC；不确定完整答案则留空。\n3. 填空/主观题只有在题干能明确推出答案时才填写，否则留空。\n4. 不要把历史作答直接当标准答案；必须基于题干判断。\n\n题型：{:?}\n题目：{}\n\n历史作答记录（仅供参考，可能错误）：{}\n原解析/导出说明：{}",
+        problem.kind(),
+        problem.prompt,
+        problem.answer,
+        if problem.explanation.trim().is_empty() {
+            "无"
+        } else {
+            &problem.explanation
+        }
+    )
+}
+
+fn parse_structured_review(text: &str) -> Option<StructuredReviewResponse> {
+    structured_json_candidates(text)
+        .into_iter()
+        .find_map(|candidate| serde_json::from_str::<StructuredReviewResponse>(&candidate).ok())
+        .or_else(|| {
+            let content = extract_explanation(text)?;
+            structured_json_candidates(&content)
+                .into_iter()
+                .find_map(|candidate| {
+                    serde_json::from_str::<StructuredReviewResponse>(&candidate).ok()
+                })
+        })
+}
+
+fn structured_json_candidates(text: &str) -> Vec<String> {
+    let mut candidates = json_candidates(text);
+    let trimmed = text.trim();
+    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}'))
+        && start <= end
+    {
+        candidates.push(trimmed[start..=end].to_owned());
+    }
+    if let Ok(unescaped) = serde_json::from_str::<String>(trimmed) {
+        candidates.extend(json_candidates(&unescaped));
+    }
+    candidates
 }
 
 fn join_annotation_handles(
@@ -1379,6 +1578,7 @@ fn local_explanation(problem: &Problem, user_answer: &str) -> String {
     )
 }
 
+#[allow(dead_code)]
 fn local_review(problem: &Problem, user_answer: &str) -> String {
     format!(
         "该题没有标准答案，建议启用 AI 批改。\n\n你的本次答案：{}\n历史作答记录：{}\n\n启用 AI 后，可根据题干判断作答情况并给出参考答案。",
@@ -1505,6 +1705,60 @@ mod tests {
     }
 
     #[test]
+    fn structured_review_updates_answer_and_clears_pending_tags() {
+        let mut problem = Problem {
+            id: "review".into(),
+            prompt: "下列哪些属于推断统计？\nA. 参数估计\nB. 绘图\nC. 假设检验".into(),
+            answer: "B".into(),
+            explanation: "因页面未给出标准答案，需人工补全正确答案。".into(),
+            tags: vec!["待复核".into(), "作答错误".into()],
+            problem_type: Some(crate::problem::ProblemType::MultipleChoice),
+            deck_name: None,
+            deck_info: None,
+            images: vec![],
+        };
+
+        let review = super::parse_structured_review(
+            r#"{"verdict":"错误","reference_answer":"C,A","explanation":"A 和 C 属于推断统计。","confidence":"高"}"#,
+        )
+        .expect("review should parse");
+        super::apply_structured_review(&mut problem, review);
+
+        assert_eq!(problem.answer, "AC");
+        assert!(!problem.needs_ai_review());
+        assert!(problem.tags.contains(&"AI复核完成".into()));
+        assert!(!problem.tags.contains(&"待复核".into()));
+        assert!(problem.explanation.contains("AI复核结果：错误"));
+    }
+
+    #[test]
+    fn structured_review_without_reference_keeps_pending_review() {
+        let mut problem = Problem {
+            id: "unknown".into(),
+            prompt: "开放题".into(),
+            answer: "历史答案".into(),
+            explanation: String::new(),
+            tags: vec!["填空需复核".into()],
+            problem_type: Some(crate::problem::ProblemType::Text),
+            deck_name: None,
+            deck_info: None,
+            images: vec![],
+        };
+
+        let review = super::parse_structured_review(
+            r#"```json
+{"verdict":"无法判断","reference_answer":"","explanation":"题干信息不足。","confidence":"低"}
+```"#,
+        )
+        .expect("review should parse from fenced json");
+        super::apply_structured_review(&mut problem, review);
+
+        assert_eq!(problem.answer, "历史答案");
+        assert!(problem.needs_ai_review());
+        assert!(problem.tags.contains(&"AI复核无法判断".into()));
+    }
+
+    #[test]
     fn solution_guide_prompt_forbids_leaking_answer() {
         let problem = Problem {
             id: "guide".into(),
@@ -1572,6 +1826,29 @@ mod tests {
                 }
             }
             let request = String::from_utf8_lossy(&request_bytes).to_string();
+            if let Some(content_length) = request
+                .lines()
+                .find_map(|line| line.strip_prefix("Content-Length:"))
+                .or_else(|| {
+                    request
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                })
+                .and_then(|value| value.trim().parse::<usize>().ok())
+            {
+                let header_len = request_bytes
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .map(|index| index + 4)
+                    .unwrap_or(request_bytes.len());
+                while request_bytes.len().saturating_sub(header_len) < content_length {
+                    let size = stream.read(&mut buffer).expect("read request body");
+                    if size == 0 {
+                        break;
+                    }
+                    request_bytes.extend_from_slice(&buffer[..size]);
+                }
+            }
             assert!(
                 request.contains("authorization: Bearer test-key")
                     || request.contains("Authorization: Bearer test-key")

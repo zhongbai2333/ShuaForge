@@ -108,14 +108,6 @@ impl PracticeDeck {
         }
     }
 
-    pub fn mark_current_wrong_and_advance(&mut self) {
-        if let Some(problem) = self.current.take() {
-            self.stats.wrong += 1;
-            self.requeue(problem);
-        }
-        self.current = self.queue.pop_front();
-    }
-
     pub fn submit_and_requeue(&mut self, answer: &str) -> SubmitResult {
         let Some(problem) = self.current.take() else {
             return SubmitResult::NoCurrentProblem;
@@ -241,20 +233,6 @@ mod tests {
         assert_eq!(deck.submit_and_requeue("a"), SubmitResult::Correct);
 
         assert_eq!(deck.stats().correct, 1);
-        assert_eq!(deck.stats().remaining, 2);
-        assert!(!deck.is_finished());
-    }
-
-    #[test]
-    fn mark_current_wrong_and_advance_counts_progress() {
-        let mut deck = PracticeDeck::with_order(
-            vec![problem("1", "a"), problem("2", "b")],
-            PracticeOrder::Sequential,
-        );
-
-        deck.mark_current_wrong_and_advance();
-
-        assert_eq!(deck.stats().wrong, 1);
         assert_eq!(deck.stats().remaining, 2);
         assert!(!deck.is_finished());
     }

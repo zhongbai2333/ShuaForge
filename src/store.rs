@@ -490,6 +490,45 @@ impl AppStore {
         Ok(updated)
     }
 
+    pub fn update_problems_after_ai_review(
+        &mut self,
+        problems: &[Problem],
+    ) -> Result<usize, Box<dyn Error + Send + Sync>> {
+        let tx = self.conn.transaction()?;
+        let mut updated = 0usize;
+        for problem in problems {
+            if !problem.tags.iter().any(|tag| {
+                matches!(tag.as_str(), "AI复核完成" | "AI复核无法判断")
+                    || tag.starts_with("AI复核结论:")
+            }) {
+                continue;
+            }
+            let tags = serde_json::to_string(&problem.tags)?;
+            let images = serde_json::to_string(&problem.images)?;
+            updated += tx.execute(
+                "update problems
+                 set answer = ?2,
+                     explanation = ?3,
+                     tags = ?4,
+                     problem_type = ?5,
+                     images_json = ?6,
+                     updated_at = datetime('now', 'localtime')
+                 where id = ?1",
+                params![
+                    problem.id,
+                    problem.answer,
+                    problem.explanation,
+                    tags,
+                    problem_type_to_str(problem.kind()),
+                    images,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        log::info!("AI-reviewed problems updated: count={updated}");
+        Ok(updated)
+    }
+
     pub fn answer_history(
         &self,
         limit: usize,
