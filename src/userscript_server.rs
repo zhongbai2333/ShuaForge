@@ -150,7 +150,9 @@ mod tests {
 
     #[test]
     fn script_response_is_extension_install_friendly() {
-        let response = request_once("GET /shuaforge-question-exporter.user.js HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+        let response = request_once(
+            "GET /shuaforge-question-exporter.user.js HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        );
 
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.contains("Content-Type: text/javascript; charset=utf-8"));
@@ -162,7 +164,9 @@ mod tests {
 
     #[test]
     fn head_request_returns_headers_without_body() {
-        let response = request_once("HEAD /shuaforge-question-exporter.user.js HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+        let response = request_once(
+            "HEAD /shuaforge-question-exporter.user.js HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        );
 
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.contains("Content-Length: "));
@@ -171,7 +175,9 @@ mod tests {
 
     #[test]
     fn options_request_supports_cors_preflight() {
-        let response = request_once("OPTIONS /shuaforge-question-exporter.user.js HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+        let response = request_once(
+            "OPTIONS /shuaforge-question-exporter.user.js HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        );
 
         assert!(response.starts_with("HTTP/1.1 204 No Content"));
         assert!(response.contains("Access-Control-Allow-Methods: GET, HEAD, OPTIONS"));
@@ -180,7 +186,8 @@ mod tests {
 
     #[test]
     fn official_install_url_wraps_local_userscript_url() {
-        let url = tampermonkey_install_url("http://127.0.0.1:5339/shuaforge-question-exporter.user.js");
+        let url =
+            tampermonkey_install_url("http://127.0.0.1:5339/shuaforge-question-exporter.user.js");
 
         assert_eq!(
             url,
@@ -198,7 +205,9 @@ mod tests {
 
         let mut stream = TcpStream::connect(addr).expect("connect server");
         stream.write_all(request.as_bytes()).expect("write request");
-        stream.shutdown(std::net::Shutdown::Write).expect("shutdown write");
+        stream
+            .shutdown(std::net::Shutdown::Write)
+            .expect("shutdown write");
 
         let mut response = String::new();
         stream.read_to_string(&mut response).expect("read response");

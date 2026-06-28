@@ -39,7 +39,9 @@ pub enum AnalysisStreamEvent {
         total: usize,
     },
     KnowledgePointsAnnotated(Vec<Problem>),
-    ToolCall { arguments_json: String },
+    ToolCall {
+        arguments_json: String,
+    },
     TextDelta(String),
     Finished,
     Failed(String),
@@ -283,7 +285,10 @@ pub fn guide_solution_process(
     problem: &Problem,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
     if !config.enabled {
-        log::info!("AI solution guide skipped: disabled, problem_id={}", problem.id);
+        log::info!(
+            "AI solution guide skipped: disabled, problem_id={}",
+            problem.id
+        );
         return Ok(local_solution_guide(problem));
     }
 
@@ -624,8 +629,7 @@ fn build_review_prompt(problem: &Problem, user_answer: &str) -> String {
 fn build_solution_guide_prompt(problem: &Problem) -> String {
     format!(
         "你是 ShuaForge 的刷题引导助手，不要自称老师。请讲解这道题的做题过程，但绝对不要直接给出最终答案或选项字母。\n\n要求：\n1. 不输出标准答案，不说“答案是X”。\n2. 用步骤引导用户如何排除干扰项、抓关键词、判断考点。\n3. 最后给一个“请你根据以上步骤自行选择”的提醒。\n4. 如果题库里保存了答案，也只能把它当作内部参考，不能泄露。\n\n题目：{}\n\n内部参考答案（禁止输出）：{}",
-        problem.prompt,
-        problem.answer
+        problem.prompt, problem.answer
     )
 }
 
@@ -766,10 +770,8 @@ fn send_chat_messages_streaming(
         .header("content-type", "application/json")
         .header("accept", "text/event-stream");
     if !config.api_key.trim().is_empty() {
-        request_builder = request_builder.header(
-            "authorization",
-            format!("Bearer {}", config.api_key.trim()),
-        );
+        request_builder =
+            request_builder.header("authorization", format!("Bearer {}", config.api_key.trim()));
     }
 
     let mut request = match request_builder.send(body) {
@@ -902,7 +904,10 @@ fn analyze_problem_set_with_tools(
         "Problem set compact analysis request prepared: title={}, problems={}, prompt_chars={}",
         title,
         problems.len(),
-        messages.iter().map(|message| message.content.chars().count()).sum::<usize>()
+        messages
+            .iter()
+            .map(|message| message.content.chars().count())
+            .sum::<usize>()
     );
     send_chat_messages(config, messages)
 }
@@ -939,7 +944,10 @@ fn analyze_problem_set_with_tools_streaming(
         "Problem set compact streaming request prepared: title={}, problems={}, prompt_chars={}",
         title,
         problems.len(),
-        messages.iter().map(|message| message.content.chars().count()).sum::<usize>()
+        messages
+            .iter()
+            .map(|message| message.content.chars().count())
+            .sum::<usize>()
     );
     let mut emitted = false;
     send_chat_messages_streaming(config, clone_chat_messages(&messages), |delta| {
@@ -1067,7 +1075,13 @@ fn compact_problem_examples(problems: &[Problem], limit: usize) -> String {
             let tags = if problem.tags.is_empty() {
                 "无".to_owned()
             } else {
-                problem.tags.iter().take(6).cloned().collect::<Vec<_>>().join("/")
+                problem
+                    .tags
+                    .iter()
+                    .take(6)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("/")
             };
             format!(
                 "{}. [{}] {} | 答案:{} | 标签:{}",
@@ -1559,7 +1573,10 @@ mod tests {
                 }
             }
             let request = String::from_utf8_lossy(&request_bytes).to_string();
-            assert!(request.contains("authorization: Bearer test-key") || request.contains("Authorization: Bearer test-key"));
+            assert!(
+                request.contains("authorization: Bearer test-key")
+                    || request.contains("Authorization: Bearer test-key")
+            );
             let response = concat!(
                 "HTTP/1.1 200 OK\r\n",
                 "Content-Type: text/event-stream\r\n",
@@ -1568,7 +1585,9 @@ mod tests {
                 "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
                 "data: [DONE]\n\n"
             );
-            stream.write_all(response.as_bytes()).expect("write response");
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
         });
 
         let config = AiConfig {
@@ -1598,7 +1617,9 @@ mod tests {
 
     #[test]
     fn knowledge_point_parser_limits_clean_tags() {
-        let points = super::parse_knowledge_points("需求弹性、供给曲线\n- 均衡价格, 这是一个非常非常非常非常非常长的标签");
+        let points = super::parse_knowledge_points(
+            "需求弹性、供给曲线\n- 均衡价格, 这是一个非常非常非常非常非常长的标签",
+        );
 
         assert_eq!(points, vec!["需求弹性", "供给曲线", "均衡价格"]);
     }
@@ -1661,7 +1682,11 @@ mod tests {
                 prompt: format!("经济学需求供给题目 {index}\nA. 是\nB. 否"),
                 answer: "A".into(),
                 explanation: String::new(),
-                tags: vec!["按得分推断".into(), "作答正确".into(), "本题得分:2.6分".into()],
+                tags: vec![
+                    "按得分推断".into(),
+                    "作答正确".into(),
+                    "本题得分:2.6分".into(),
+                ],
                 problem_type: Some(crate::problem::ProblemType::SingleChoice),
                 deck_name: None,
                 deck_info: None,

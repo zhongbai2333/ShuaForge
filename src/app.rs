@@ -6,7 +6,7 @@ use crate::{
         review_answer, save_ai_config, stream_problem_set_analysis_tool,
     },
     ai_import::{AiImportResult, import_problem_bank_with_ai},
-    deck::{PracticeDeck, PracticeOrder, SubmitResult},
+    deck::{PracticeDeck, PracticeDeckSnapshot, PracticeOrder, SubmitResult},
     logging,
     problem::{Problem, ProblemType, load_problems, normalize_choice_answer},
     self_update::{self, UpdateInfo, UpdateOutcome},
@@ -102,6 +102,14 @@ struct PersistedAnalysisDialog {
     latest_result: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedPracticeSession {
+    key: String,
+    active_deck_name: Option<String>,
+    guided_problem_id: Option<String>,
+    deck: PracticeDeckSnapshot,
+}
+
 #[derive(Debug, Clone)]
 struct AnalysisAsyncResponse {
     generation_id: u64,
@@ -153,7 +161,12 @@ impl AnalysisProgressState {
         if self.total == 0 {
             self.label.clone()
         } else {
-            format!("{} · {}/{}", self.label, self.current.min(self.total), self.total)
+            format!(
+                "{} · {}/{}",
+                self.label,
+                self.current.min(self.total),
+                self.total
+            )
         }
     }
 }
@@ -291,6 +304,8 @@ const SETTINGS_KEY: &str = "app_settings";
 const UPDATE_SETTINGS_KEY: &str = "update_settings";
 const ANALYSIS_CACHE_KEY: &str = "analysis_dialog_cache";
 const ANALYSIS_TEXT_CACHE_KEY: &str = "analysis_text_cache";
+const PRACTICE_SESSION_KEY: &str = "practice_session:latest";
+
 const CARD_WIDTH: f32 = 300.0;
 const GROUP_CARD_HEIGHT: f32 = 158.0;
 const DECK_CARD_HEIGHT: f32 = 188.0;
@@ -437,6 +452,7 @@ pub struct ShuaForgeApp {
     new_group_name: String,
     dragging_deck_id: Option<i64>,
     dragging_group_id: Option<i64>,
+    guided_problem_id: Option<String>,
     log_path: Option<PathBuf>,
 }
 
@@ -518,6 +534,7 @@ impl ShuaForgeApp {
             new_group_name: "新题组".into(),
             dragging_deck_id: None,
             dragging_group_id: None,
+            guided_problem_id: None,
             log_path,
         };
         app.load_analysis_cache();
@@ -626,12 +643,11 @@ impl ShuaForgeApp {
         thread::spawn(move || {
             let progress_sender = sender.clone();
             let on_progress: self_update::ProgressCallback = Box::new(move |downloaded, total| {
-                let _ = progress_sender.send(UpdateAsyncResponse::ApplyProgress {
-                    downloaded,
-                    total,
-                });
+                let _ =
+                    progress_sender.send(UpdateAsyncResponse::ApplyProgress { downloaded, total });
             });
-            let result = self_update::perform_update(Some(on_progress)).map_err(|err| err.to_string());
+            let result =
+                self_update::perform_update(Some(on_progress)).map_err(|err| err.to_string());
             let _ = sender.send(UpdateAsyncResponse::ApplyFinished(result));
         });
     }
@@ -674,74 +690,79 @@ impl ShuaForgeApp {
         let mut clear_receiver = false;
         for response in responses {
             match response {
-            UpdateAsyncResponse::CheckFinished(result) => {
-                clear_receiver = true;
-                self.is_update_checking = false;
-                let source = self
-                    .update_check_source
-                    .take()
-                    .unwrap_or(UpdateCheckSource::Manual);
-                match result {
-                    Ok(Some(info)) => {
-                        let ignored = self.ignored_update_tag.as_deref() == Some(&info.tag_name);
-                        self.update_status = format!(
-                            "发现新版本 {}（当前 {}）。",
-                            info.tag_name,
-                            self_update::current_tag()
-                        );
-                        self.update_info = Some(info);
-                        self.show_update_prompt = !ignored || source == UpdateCheckSource::Manual;
-                    }
-                    Ok(None) => {
-                        self.update_info = None;
-                        self.show_update_prompt = false;
-                        self.update_status =
-                            format!("已是最新版本 {}。", self_update::current_tag());
-                    }
-                    Err(err) => {
-                        self.update_status = format!("检查更新失败：{err}");
-                        if source == UpdateCheckSource::Manual {
-                            self.status = self.update_status.clone();
+                UpdateAsyncResponse::CheckFinished(result) => {
+                    clear_receiver = true;
+                    self.is_update_checking = false;
+                    let source = self
+                        .update_check_source
+                        .take()
+                        .unwrap_or(UpdateCheckSource::Manual);
+                    match result {
+                        Ok(Some(info)) => {
+                            let ignored =
+                                self.ignored_update_tag.as_deref() == Some(&info.tag_name);
+                            self.update_status = format!(
+                                "发现新版本 {}（当前 {}）。",
+                                info.tag_name,
+                                self_update::current_tag()
+                            );
+                            self.update_info = Some(info);
+                            self.show_update_prompt =
+                                !ignored || source == UpdateCheckSource::Manual;
+                        }
+                        Ok(None) => {
+                            self.update_info = None;
+                            self.show_update_prompt = false;
+                            self.update_status =
+                                format!("已是最新版本 {}。", self_update::current_tag());
+                        }
+                        Err(err) => {
+                            self.update_status = format!("检查更新失败：{err}");
+                            if source == UpdateCheckSource::Manual {
+                                self.status = self.update_status.clone();
+                            }
                         }
                     }
                 }
-            }
-            UpdateAsyncResponse::ApplyProgress { downloaded, total } => {
-                self.update_downloaded_bytes = downloaded;
-                if total > 0 {
-                    self.update_total_bytes = total;
+                UpdateAsyncResponse::ApplyProgress { downloaded, total } => {
+                    self.update_downloaded_bytes = downloaded;
+                    if total > 0 {
+                        self.update_total_bytes = total;
+                    }
+                    self.update_status = if self.update_total_bytes > 0 {
+                        format!(
+                            "正在下载更新... {} / {}",
+                            format_bytes(self.update_downloaded_bytes),
+                            format_bytes(self.update_total_bytes)
+                        )
+                    } else {
+                        format!(
+                            "正在下载更新... {}",
+                            format_bytes(self.update_downloaded_bytes)
+                        )
+                    };
                 }
-                self.update_status = if self.update_total_bytes > 0 {
-                    format!(
-                        "正在下载更新... {} / {}",
-                        format_bytes(self.update_downloaded_bytes),
-                        format_bytes(self.update_total_bytes)
-                    )
-                } else {
-                    format!("正在下载更新... {}", format_bytes(self.update_downloaded_bytes))
-                };
-            }
-            UpdateAsyncResponse::ApplyFinished(result) => {
-                clear_receiver = true;
-                self.is_update_applying = false;
-                match result {
-                    Ok(UpdateOutcome::UpToDate) => {
-                        self.update_status = "已是最新版本。".into();
+                UpdateAsyncResponse::ApplyFinished(result) => {
+                    clear_receiver = true;
+                    self.is_update_applying = false;
+                    match result {
+                        Ok(UpdateOutcome::UpToDate) => {
+                            self.update_status = "已是最新版本。".into();
+                        }
+                        Ok(UpdateOutcome::Skipped) => {
+                            self.update_status =
+                                "开发构建或当前环境不适合自动替换，已跳过更新。".into();
+                        }
+                        Ok(UpdateOutcome::UpdateLaunched) => {
+                            self.update_status = "更新流程已启动，请按提示完成。".into();
+                        }
+                        Err(err) => {
+                            self.update_status = format!("更新失败：{err}");
+                        }
                     }
-                    Ok(UpdateOutcome::Skipped) => {
-                        self.update_status =
-                            "开发构建或当前环境不适合自动替换，已跳过更新。".into();
-                    }
-                    Ok(UpdateOutcome::UpdateLaunched) => {
-                        self.update_status = "更新流程已启动，请按提示完成。".into();
-                    }
-                    Err(err) => {
-                        self.update_status = format!("更新失败：{err}");
-                    }
+                    self.status = self.update_status.clone();
                 }
-                self.status = self.update_status.clone();
             }
-        }
         }
         if clear_receiver {
             self.update_receiver = None;
@@ -779,7 +800,8 @@ impl ShuaForgeApp {
             self.is_ai_importing = true;
             self.status = format!("AI 正在解析并导入题库：{}", path.display());
             thread::spawn(move || {
-                let result = import_problem_bank_with_ai(&config, &path).map_err(|err| err.to_string());
+                let result =
+                    import_problem_bank_with_ai(&config, &path).map_err(|err| err.to_string());
                 let _ = sender.send(AiImportAsyncResponse { path, result });
             });
         }
@@ -810,6 +832,7 @@ impl ShuaForgeApp {
         }
         self.loaded_path = Some(path);
         self.deck = None;
+        self.guided_problem_id = None;
         self.view = AppView::Library;
     }
 
@@ -843,7 +866,9 @@ impl ShuaForgeApp {
         match store.load_all_problems() {
             Ok(problems) if !problems.is_empty() => {
                 let count = problems.len();
+                self.clear_latest_practice_session();
                 self.deck = Some(PracticeDeck::with_order(problems, self.practice_order));
+                self.guided_problem_id = None;
                 self.active_deck_name = Some("全部题库".into());
                 self.view = AppView::Practice;
                 self.status = format!("已从全部题库载入 {count} 道题。");
@@ -878,7 +903,9 @@ impl ShuaForgeApp {
         match store.load_deck_problems(deck_id) {
             Ok(problems) if !problems.is_empty() => {
                 let count = problems.len();
+                self.clear_latest_practice_session();
                 self.deck = Some(PracticeDeck::with_order(problems, self.practice_order));
+                self.guided_problem_id = None;
                 self.active_deck_name = Some(deck_name.clone());
                 self.loaded_path = None;
                 self.view = AppView::Practice;
@@ -900,7 +927,9 @@ impl ShuaForgeApp {
         match store.load_group_problems(group_id) {
             Ok(problems) if !problems.is_empty() => {
                 let count = problems.len();
+                self.clear_latest_practice_session();
                 self.deck = Some(PracticeDeck::with_order(problems, self.practice_order));
+                self.guided_problem_id = None;
                 self.active_deck_name = Some(format!("题组：{group_name}"));
                 self.loaded_path = None;
                 self.view = AppView::Practice;
@@ -1015,9 +1044,11 @@ impl ShuaForgeApp {
     }
 
     fn back_to_library(&mut self) {
+        self.persist_current_practice_session();
         self.view = AppView::Library;
         self.deck = None;
         self.active_deck_name = None;
+        self.guided_problem_id = None;
         self.clear_answer_inputs();
         self.analysis.clear();
         self.refresh_store_state();
@@ -1027,6 +1058,91 @@ impl ShuaForgeApp {
         self.answer_input.clear();
         self.selected_single = None;
         self.selected_multiple.clear();
+    }
+
+    fn current_practice_session_key(&self) -> Option<String> {
+        self.deck.as_ref()?;
+        Some(PRACTICE_SESSION_KEY.to_owned())
+    }
+
+    fn has_saved_practice_session(&self) -> bool {
+        self.store
+            .as_ref()
+            .and_then(|store| store.get_setting(PRACTICE_SESSION_KEY).ok().flatten())
+            .is_some()
+    }
+
+    fn load_practice_session(&mut self) -> Option<PracticeDeck> {
+        let store = self.store.as_ref()?;
+        let value = store.get_setting(PRACTICE_SESSION_KEY).ok().flatten()?;
+        let session = serde_json::from_str::<PersistedPracticeSession>(&value).ok()?;
+        if session.key != PRACTICE_SESSION_KEY {
+            return None;
+        }
+        self.active_deck_name = session.active_deck_name;
+        self.guided_problem_id = session.guided_problem_id;
+        log::info!("Restored latest practice session");
+        Some(PracticeDeck::from_snapshot(session.deck))
+    }
+
+    fn continue_latest_practice_session(&mut self) {
+        match self.load_practice_session() {
+            Some(deck) => {
+                self.deck = Some(deck);
+                self.view = AppView::Practice;
+                self.clear_answer_inputs();
+                self.analysis.clear();
+                self.status = "已恢复上次退出/返回前的练习进度。".into();
+            }
+            None => {
+                self.status = "没有可继续的练习进度。".into();
+            }
+        }
+    }
+
+    fn persist_current_practice_session(&mut self) {
+        let Some(key) = self.current_practice_session_key() else {
+            return;
+        };
+        let Some(deck) = &self.deck else {
+            return;
+        };
+        let Some(store) = &self.store else {
+            return;
+        };
+        let session = PersistedPracticeSession {
+            key: key.clone(),
+            active_deck_name: self.active_deck_name.clone(),
+            guided_problem_id: self.guided_problem_id.clone(),
+            deck: deck.snapshot(),
+        };
+        let Ok(value) = serde_json::to_string(&session) else {
+            return;
+        };
+        if let Err(err) = store.set_setting(&key, &value) {
+            self.status = format!("练习进度保存失败：{err}");
+        }
+    }
+
+    fn clear_current_practice_session_if_finished(&mut self) {
+        let Some(deck) = &self.deck else {
+            return;
+        };
+        if !deck.is_finished() {
+            return;
+        }
+        let Some(key) = self.current_practice_session_key() else {
+            return;
+        };
+        if let Some(store) = &self.store {
+            let _ = store.delete_setting(&key);
+        }
+    }
+
+    fn clear_latest_practice_session(&mut self) {
+        if let Some(store) = &self.store {
+            let _ = store.delete_setting(PRACTICE_SESSION_KEY);
+        }
     }
 
     fn load_ai_config(&mut self) {
@@ -1083,21 +1199,35 @@ impl ShuaForgeApp {
         };
 
         if problem.needs_ai_review() {
-            deck.skip();
+            deck.mark_current_wrong_and_advance();
             self.record_answer(&problem, &user_answer, false);
-            self.status = "该题没有标准答案，已交给 AI 批改，并放回队尾继续复习。".into();
+            self.status = "该题没有标准答案，已交给 AI 批改，并重新插回题库继续复习。".into();
             self.analysis = "AI 批改中...".into();
             self.request_ai_review(problem, user_answer);
             self.clear_answer_inputs();
+            self.guided_problem_id = None;
+            self.persist_current_practice_session();
             self.refresh_store_state();
             return;
         }
 
-        match deck.submit(&user_answer) {
+        let keep_after_submit = self.guided_problem_id.as_deref() == Some(problem.id.as_str());
+        let result = if keep_after_submit {
+            deck.submit_and_requeue(&user_answer)
+        } else {
+            deck.submit(&user_answer)
+        };
+
+        match result {
             SubmitResult::Correct => {
                 self.record_answer(&problem, &user_answer, true);
-                self.status = "回答正确，已从题库移除。".into();
-                self.analysis = "回答正确，本题已从当前练习队列移除。".into();
+                if keep_after_submit {
+                    self.status = "回答正确；由于你查看过 AI 解题过程，本题已重新插回题库。".into();
+                    self.analysis = "回答正确；本题已保留在当前练习队列中，稍后会再次出现。".into();
+                } else {
+                    self.status = "回答正确，已从题库移除。".into();
+                    self.analysis = "回答正确，本题已从当前练习队列移除。".into();
+                }
             }
             SubmitResult::Wrong {
                 expected,
@@ -1116,6 +1246,12 @@ impl ShuaForgeApp {
         }
 
         self.clear_answer_inputs();
+        self.guided_problem_id = None;
+        if self.deck.as_ref().is_some_and(PracticeDeck::is_finished) {
+            self.clear_current_practice_session_if_finished();
+        } else {
+            self.persist_current_practice_session();
+        }
         self.refresh_store_state();
     }
 
@@ -1180,10 +1316,11 @@ impl ShuaForgeApp {
         };
 
         if let Some(deck) = &mut self.deck {
-            deck.skip();
+            deck.requeue_current_without_advancing();
         }
-        self.clear_answer_inputs();
-        self.status = "AI 正在生成不泄答案的做题过程；本题已放回队尾。".into();
+        self.guided_problem_id = Some(problem.id.clone());
+        self.persist_current_practice_session();
+        self.status = "AI 正在生成不泄答案的做题过程；本题已重新插回题库，但当前不会跳题。".into();
         self.analysis = "AI 引导生成中...".into();
 
         let config = self.ai_config.clone();
@@ -1372,7 +1509,11 @@ impl ShuaForgeApp {
         let config = self.ai_config.clone();
         let (sender, receiver) = mpsc::channel();
         self.analysis_stream_receiver = Some(receiver);
-        self.analysis_progress = Some(AnalysisProgressState::new("准备重分析知识点", 0, problems.len()));
+        self.analysis_progress = Some(AnalysisProgressState::new(
+            "准备重分析知识点",
+            0,
+            problems.len(),
+        ));
         self.status = format!("正在重分析{}的 AI 知识点...", key.title);
         if let Some(dialog) = &mut self.analysis_dialog {
             dialog.is_loading = true;
@@ -1572,13 +1713,16 @@ impl ShuaForgeApp {
                     current,
                     total,
                 } => {
-                    self.analysis_progress = Some(AnalysisProgressState::new(label, current, total));
+                    self.analysis_progress =
+                        Some(AnalysisProgressState::new(label, current, total));
                 }
                 AnalysisStreamEvent::KnowledgePointsAnnotated(problems) => {
                     if let Some(store) = &mut self.store {
                         match store.update_problem_tags(&problems) {
                             Ok(updated) if updated > 0 => {
-                                self.status = format!("已保存 {updated} 道题的 AI 知识点标签，正在生成分析...");
+                                self.status = format!(
+                                    "已保存 {updated} 道题的 AI 知识点标签，正在生成分析..."
+                                );
                             }
                             Ok(_) => {
                                 self.status = "AI 知识点标签无需更新，正在生成分析...".into();
@@ -1600,11 +1744,8 @@ impl ShuaForgeApp {
                     }
                 }
                 AnalysisStreamEvent::ToolCall { arguments_json } => {
-                    self.analysis_progress = Some(AnalysisProgressState::new(
-                        "AI 正在生成分析报告",
-                        0,
-                        0,
-                    ));
+                    self.analysis_progress =
+                        Some(AnalysisProgressState::new("AI 正在生成分析报告", 0, 0));
                     if let Some(dialog) = &mut self.analysis_dialog
                         && let Some(tool_message) = dialog
                             .messages
@@ -1616,11 +1757,8 @@ impl ShuaForgeApp {
                     }
                 }
                 AnalysisStreamEvent::TextDelta(delta) => {
-                    self.analysis_progress = Some(AnalysisProgressState::new(
-                        "AI 正在生成分析报告",
-                        0,
-                        0,
-                    ));
+                    self.analysis_progress =
+                        Some(AnalysisProgressState::new("AI 正在生成分析报告", 0, 0));
                     self.analysis.push_str(&delta);
                     if let Some(dialog) = &mut self.analysis_dialog {
                         if let Some(assistant_message) = dialog
@@ -1650,11 +1788,8 @@ impl ShuaForgeApp {
                 }
                 AnalysisStreamEvent::Failed(reason) => {
                     self.status = format!("AI 分析失败，已尝试回退：{reason}");
-                    self.analysis_progress = Some(AnalysisProgressState::new(
-                        "正在生成本地回退分析",
-                        0,
-                        0,
-                    ));
+                    self.analysis_progress =
+                        Some(AnalysisProgressState::new("正在生成本地回退分析", 0, 0));
                 }
             }
         }
@@ -1859,6 +1994,9 @@ impl ShuaForgeApp {
             }
             if ui.button("练习全部题库").clicked() {
                 self.restart_from_store();
+            }
+            if self.has_saved_practice_session() && ui.button("继续上次练习").clicked() {
+                self.continue_latest_practice_session();
             }
             ui.separator();
             ui.label("新题组");
@@ -3097,7 +3235,11 @@ impl eframe::App for ShuaForgeApp {
                 ui.add(
                     egui::ProgressBar::new(progress)
                         .desired_width(ui.available_width())
-                        .text(format!("经验值 Lv.{} · {completed}/{}", stats.correct / 10 + 1, stats.total)),
+                        .text(format!(
+                            "经验值 Lv.{} · {completed}/{}",
+                            stats.correct / 10 + 1,
+                            stats.total
+                        )),
                 );
                 ui.separator();
 
@@ -3137,7 +3279,7 @@ impl eframe::App for ShuaForgeApp {
                         if ui.button("AI 引导解题（不看答案）").clicked() {
                             solution_guide_requested = true;
                         }
-                        if ui.button("跳过并放回队尾").clicked() {
+                        if ui.button("跳过并重新插回题库").clicked() {
                             skip_requested = true;
                         }
                     });
@@ -3163,7 +3305,9 @@ impl eframe::App for ShuaForgeApp {
             if skip_requested && let Some(deck) = &mut self.deck {
                 deck.skip();
                 self.clear_answer_inputs();
-                self.status = "已跳过，题目放回队尾。".into();
+                self.guided_problem_id = None;
+                self.persist_current_practice_session();
+                self.status = "已跳过，题目已重新插回题库。".into();
             }
 
             ui.separator();

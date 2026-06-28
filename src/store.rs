@@ -599,6 +599,13 @@ impl AppStore {
         Ok(())
     }
 
+    pub fn delete_setting(&self, key: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+        self.conn
+            .execute("delete from app_settings where key = ?1", params![key])?;
+        log::info!("Setting deleted: key={key}");
+        Ok(())
+    }
+
     fn migrate(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
         self.conn.execute_batch(
             "create table if not exists problems (
@@ -949,6 +956,28 @@ mod tests {
                 Some(r#"{"theme":"light"}"#)
             );
         }
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn app_settings_can_be_deleted() {
+        let path = temp_db_path("delete-settings");
+        let store = AppStore::open(path.clone()).expect("open temp db");
+
+        store
+            .set_setting("practice_session:test", r#"{"ok":true}"#)
+            .expect("set setting");
+        store
+            .delete_setting("practice_session:test")
+            .expect("delete setting");
+
+        assert_eq!(
+            store
+                .get_setting("practice_session:test")
+                .expect("get deleted setting"),
+            None
+        );
 
         let _ = std::fs::remove_file(path);
     }

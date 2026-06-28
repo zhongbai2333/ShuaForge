@@ -56,7 +56,9 @@ fn extract_problem_bank_text(path: &Path) -> Result<String, Box<dyn Error + Send
         .map(str::to_ascii_lowercase)
         .as_deref()
     {
-        Some("csv") => Ok(fs::read_to_string(path)?.trim_start_matches('\u{feff}').to_owned()),
+        Some("csv") => Ok(fs::read_to_string(path)?
+            .trim_start_matches('\u{feff}')
+            .to_owned()),
         Some("xlsx") => extract_xlsx_text(path),
         Some("pdf") => Ok(pdf_extract::extract_text(path)?),
         _ => Err("AI 动态导入目前仅支持 .csv / .xlsx / .pdf".into()),
@@ -87,7 +89,9 @@ fn extract_xlsx_text(path: &Path) -> Result<String, Box<dyn Error + Send + Sync>
 fn truncate_for_prompt(text: &str) -> String {
     let mut truncated = text.chars().take(MAX_IMPORT_TEXT_CHARS).collect::<String>();
     if text.chars().count() > MAX_IMPORT_TEXT_CHARS {
-        truncated.push_str("\n\n[ShuaForge: 文件过长，以上为前部可解析内容，请尽量从已提供文本中提取题目。]");
+        truncated.push_str(
+            "\n\n[ShuaForge: 文件过长，以上为前部可解析内容，请尽量从已提供文本中提取题目。]",
+        );
     }
     truncated
 }

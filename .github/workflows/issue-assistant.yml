@@ -123,8 +123,13 @@ jobs:
                           .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, ' ')
                           .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/g, '�')
                           .replace(/(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '�');
-                        if (text.length > limit) text = text.slice(0, limit) + '\n…（内容已截断）';
-                        return text;
+                        return truncateAiContent(text, limit);
+                      };
+
+                      const truncateAiContent = (value, limit) => {
+                        const chars = Array.from(String(value || ''));
+                        if (chars.length <= limit) return chars.join('');
+                        return chars.slice(0, limit).join('') + '\n…（内容已截断）';
                       };
 
                       const safeIssueTitle = sanitizeAiContent(issue.title, 500);
@@ -254,10 +259,14 @@ jobs:
 
                         let lastError;
                         for (let attempt = 0; attempt <= maxRetries; attempt++) {
+                          const safeMessages = messages.map(message => ({
+                            ...message,
+                            content: sanitizeAiContent(message?.content, 16000)
+                          }));
                           const payload = {
                             model: requestModel,
                             max_tokens: maxTokens,
-                            messages
+                            messages: safeMessages
                           };
 
                           if (thinking === 'enabled' && supportsThinking) {
@@ -334,7 +343,7 @@ jobs:
                         safeIssueTitle,
                         '',
                         'Issue 正文：',
-                        safeIssueBody.slice(0, 2500)
+                        truncateAiContent(safeIssueBody, 2500)
                       ].join('\n');
 
                       const generateDuplicateQueries = async () => {
@@ -405,11 +414,11 @@ jobs:
                       const duplicateCandidateNumbers = new Set(duplicateCandidatesRaw.map(i => i.number));
                       const duplicateCandidates = duplicateCandidatesRaw.map(i => {
                         const labels = (i.labels || []).map(l => typeof l === 'string' ? l : l.name).filter(Boolean);
-                        const bodyShort = sanitizeAiContent(i.body || '', 800).replace(/\s+/g, ' ').slice(0, 240);
+                        const bodyShort = truncateAiContent(sanitizeAiContent(i.body || '', 800).replace(/\s+/g, ' '), 240);
                         const state = String(i.state || 'unknown').toLowerCase();
                         const stateReason = String(i.state_reason || i.stateReason || '').toLowerCase();
                         const updatedAt = String(i.updated_at || i.updatedAt || '').replace(/T/, ' ').replace(/Z$/, ' UTC');
-                        const titleShort = sanitizeAiContent(i.title || '', 400).replace(/\s+/g, ' ').slice(0, 180);
+                        const titleShort = truncateAiContent(sanitizeAiContent(i.title || '', 400).replace(/\s+/g, ' '), 180);
                         return `#${i.number} | state=${state}${stateReason ? `/${stateReason}` : ''} | updated=${updatedAt || 'unknown'} | ${titleShort} | labels=[${labels.join(', ')}] | body=${bodyShort}`;
                       });
 

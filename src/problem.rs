@@ -57,13 +57,13 @@ struct ZipProblemBank {
 impl Problem {
     pub fn needs_ai_review(&self) -> bool {
         self.explanation.contains("未批改：页面没有提供正确答案")
-            || self.explanation.contains("因页面未给出标准答案，需人工补全正确答案")
-            || self.tags.iter().any(|tag| {
-                matches!(
-                    tag.as_str(),
-                    "待复核" | "多选需复核" | "填空需复核"
-                )
-            })
+            || self
+                .explanation
+                .contains("因页面未给出标准答案，需人工补全正确答案")
+            || self
+                .tags
+                .iter()
+                .any(|tag| matches!(tag.as_str(), "待复核" | "多选需复核" | "填空需复核"))
     }
 
     pub fn is_correct(&self, input: &str) -> bool {
