@@ -324,12 +324,11 @@ pub fn annotate_problem_knowledge_points_with_progress(
         return problems;
     }
 
-    let model = config
-        .fast_model
-        .trim()
-        .is_empty()
-        .then(|| config.model.clone())
-        .unwrap_or_else(|| config.fast_model.trim().to_owned());
+    let model = if config.fast_model.trim().is_empty() {
+        config.model.clone()
+    } else {
+        config.fast_model.trim().to_owned()
+    };
     if model.trim().is_empty() {
         return problems;
     }
@@ -1084,9 +1083,9 @@ fn compact_problem_examples(problems: &[Problem], limit: usize) -> String {
                     .join("/")
             };
             format!(
-                "{}. [{}] {} | 答案:{} | 标签:{}",
+                "{}. [{:?}] {} | 答案:{} | 标签:{}",
                 index + 1,
-                format!("{:?}", problem.kind()),
+                problem.kind(),
                 summarize_for_prompt(&problem.question_text(), 80),
                 summarize_for_prompt(&problem.answer, 24),
                 tags
