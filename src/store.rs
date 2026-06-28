@@ -469,6 +469,27 @@ impl AppStore {
         Ok(())
     }
 
+    pub fn update_problem_tags(
+        &mut self,
+        problems: &[Problem],
+    ) -> Result<usize, Box<dyn Error + Send + Sync>> {
+        let tx = self.conn.transaction()?;
+        let mut updated = 0usize;
+        for problem in problems {
+            let tags = serde_json::to_string(&problem.tags)?;
+            updated += tx.execute(
+                "update problems
+                 set tags = ?2,
+                     updated_at = datetime('now', 'localtime')
+                 where id = ?1",
+                params![problem.id, tags],
+            )?;
+        }
+        tx.commit()?;
+        log::info!("Problem tags updated: count={updated}");
+        Ok(updated)
+    }
+
     pub fn answer_history(
         &self,
         limit: usize,
@@ -878,6 +899,32 @@ mod tests {
             .expect("load group problems after");
         assert_eq!(problems_after.len(), 1);
         assert_eq!(problems_after[0].id, "p2");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn problem_tags_can_be_updated_after_import() {
+        let path = temp_db_path("update-problem-tags");
+        let mut store = AppStore::open(path.clone()).expect("open temp db");
+        let summary = store
+            .import_problems(&[problem("p1")], "deck-a.csv")
+            .expect("import deck");
+
+        let mut problems = store
+            .load_deck_problems(summary.deck_id)
+            .expect("load deck problems");
+        problems[0].tags.push("AI知识点:需求弹性".into());
+
+        let updated = store
+            .update_problem_tags(&problems)
+            .expect("update problem tags");
+        assert_eq!(updated, 1);
+
+        let reloaded = store
+            .load_deck_problems(summary.deck_id)
+            .expect("reload deck problems");
+        assert!(reloaded[0].tags.contains(&"AI知识点:需求弹性".into()));
 
         let _ = std::fs::remove_file(path);
     }

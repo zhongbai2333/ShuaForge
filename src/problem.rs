@@ -57,6 +57,13 @@ struct ZipProblemBank {
 impl Problem {
     pub fn needs_ai_review(&self) -> bool {
         self.explanation.contains("未批改：页面没有提供正确答案")
+            || self.explanation.contains("因页面未给出标准答案，需人工补全正确答案")
+            || self.tags.iter().any(|tag| {
+                matches!(
+                    tag.as_str(),
+                    "待复核" | "多选需复核" | "填空需复核"
+                )
+            })
     }
 
     pub fn is_correct(&self, input: &str) -> bool {
@@ -587,6 +594,40 @@ mod tests {
             answer: "我的旧答案".into(),
             explanation: "未批改：页面没有提供正确答案，已使用“我的答案”作为临时答案。".into(),
             tags: vec![],
+            problem_type: None,
+            deck_name: None,
+            deck_info: None,
+            images: vec![],
+        };
+
+        assert!(problem.needs_ai_review());
+    }
+
+    #[test]
+    fn score_inferred_correct_choice_does_not_need_ai_review() {
+        let problem = Problem {
+            id: "score-correct".into(),
+            prompt: "单选题\nA. 正确项\nB. 干扰项".into(),
+            answer: "A".into(),
+            explanation: "页面没有提供标准答案，已使用“我的答案”作为导出答案；本题得分可用于判断该作答是否正确。 当前作答得分 2.6 分，单选题可推断该答案正确。".into(),
+            tags: vec!["无标准答案".into(), "按得分推断".into(), "本题得分:2.6分".into(), "作答正确".into()],
+            problem_type: None,
+            deck_name: None,
+            deck_info: None,
+            images: vec![],
+        };
+
+        assert!(!problem.needs_ai_review());
+    }
+
+    #[test]
+    fn score_inferred_wrong_choice_needs_ai_review() {
+        let problem = Problem {
+            id: "score-wrong".into(),
+            prompt: "单选题\nA. 正确项\nB. 错误项".into(),
+            answer: "B".into(),
+            explanation: "页面没有提供标准答案，已使用“我的答案”作为导出答案；本题得分可用于判断该作答是否正确。 当前作答得分 0 分，单选题可推断该作答错误；因页面未给出标准答案，需人工补全正确答案。".into(),
+            tags: vec!["无标准答案".into(), "按得分推断".into(), "本题得分:0分".into(), "作答错误".into(), "待复核".into()],
             problem_type: None,
             deck_name: None,
             deck_info: None,

@@ -109,11 +109,32 @@ jobs:
                       const owner = context.repo.owner;
                       const repo = context.repo.repo;
 
+                      const sanitizeAiContent = (value, limit = 12000) => {
+                        let text = String(value || '')
+                          .normalize('NFC')
+                          // Some completion providers parse message content escapes again.
+                          // A user-provided literal like incomplete \x / \u can then break
+                          // request parsing with "unexpected end of hex escape" even though
+                          // JSON.stringify produced valid JSON. Make those snippets plain text.
+                          .replace(/\\x/g, '∖x')
+                          .replace(/\\u(?![0-9A-Fa-f]{4})/g, '∖u')
+                          .replace(/\\U(?![0-9A-Fa-f]{8})/g, '∖U')
+                          .replace(/\\$/g, '∖')
+                          .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, ' ')
+                          .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/g, '�')
+                          .replace(/(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '�');
+                        if (text.length > limit) text = text.slice(0, limit) + '\n…（内容已截断）';
+                        return text;
+                      };
+
+                      const safeIssueTitle = sanitizeAiContent(issue.title, 500);
+                      const safeIssueBody = sanitizeAiContent(body, 12000);
+
                       const failAnalysis = (reason) => {
                         const message = String(reason || 'unknown-error').slice(0, 1500);
                         const fallback = {
                           summary: 'AI 审查未成功完成，已转为人工分诊建议。',
-                          better_title: String(issue?.title || '未提供标题').slice(0, 200),
+                          better_title: safeIssueTitle.slice(0, 200) || '未提供标题',
                           type: 'Question',
                           negative: 'none',
                           priority: '',
@@ -288,8 +309,8 @@ jobs:
                         .trim()
                         .slice(0, 80);
                       const localDuplicateQueries = () => {
-                        const title = normalizeText(issue.title).replace(/^\[[^\]]+\]\s*/, '');
-                        const source = `${title} ${normalizeText(body).slice(0, 1000)}`.toLowerCase();
+                        const title = normalizeText(safeIssueTitle).replace(/^\[[^\]]+\]\s*/, '');
+                        const source = `${title} ${normalizeText(safeIssueBody).slice(0, 1000)}`.toLowerCase();
                         const tokens = Array.from(source.matchAll(/[a-z][a-z0-9_-]{2,}|[\u4e00-\u9fff]{2,}|\d{3,}/g))
                           .map(m => m[0])
                           .filter(token => !stopWords.has(token) && token.length <= 30);
@@ -310,10 +331,10 @@ jobs:
                         '关键词要适合召回相似 Issues（包括 Open 和 Closed）；第一个可以较精确，后续应更短更泛。',
                         '',
                         'Issue 标题：',
-                        issue.title,
+                        safeIssueTitle,
                         '',
                         'Issue 正文：',
-                        body.slice(0, 2500)
+                        safeIssueBody.slice(0, 2500)
                       ].join('\n');
 
                       const generateDuplicateQueries = async () => {
@@ -384,11 +405,12 @@ jobs:
                       const duplicateCandidateNumbers = new Set(duplicateCandidatesRaw.map(i => i.number));
                       const duplicateCandidates = duplicateCandidatesRaw.map(i => {
                         const labels = (i.labels || []).map(l => typeof l === 'string' ? l : l.name).filter(Boolean);
-                        const bodyShort = String(i.body || '').replace(/\s+/g, ' ').slice(0, 240);
+                        const bodyShort = sanitizeAiContent(i.body || '', 800).replace(/\s+/g, ' ').slice(0, 240);
                         const state = String(i.state || 'unknown').toLowerCase();
                         const stateReason = String(i.state_reason || i.stateReason || '').toLowerCase();
                         const updatedAt = String(i.updated_at || i.updatedAt || '').replace(/T/, ' ').replace(/Z$/, ' UTC');
-                        return `#${i.number} | state=${state}${stateReason ? `/${stateReason}` : ''} | updated=${updatedAt || 'unknown'} | ${i.title} | labels=[${labels.join(', ')}] | body=${bodyShort}`;
+                        const titleShort = sanitizeAiContent(i.title || '', 400).replace(/\s+/g, ' ').slice(0, 180);
+                        return `#${i.number} | state=${state}${stateReason ? `/${stateReason}` : ''} | updated=${updatedAt || 'unknown'} | ${titleShort} | labels=[${labels.join(', ')}] | body=${bodyShort}`;
                       });
 
                       const allowedType = ['BUG', 'Documentation', 'Enhancement', 'Question'];
@@ -444,10 +466,10 @@ jobs:
                         '标题规则：negative=Duplicate 时前缀用 [Duplicate]，negative=WontFix 时用 [WontFix]，negative=Invalid 时用 [Invalid]；其余按 type 加前缀：BUG=>[BUG]，Enhancement=>[Feature]，Question=>[Question]，Documentation=>[Doc]。',
                         '',
                         'Issue 标题：',
-                        issue.title,
+                        safeIssueTitle,
                         '',
                         'Issue 正文：',
-                        body,
+                        safeIssueBody,
                         '',
                         '候选 Issues（由关键词检索召回，仅此列表参与重复判定）：',
                         duplicateCandidates.length ? duplicateCandidates.join('\n') : '（无候选）'
@@ -514,7 +536,7 @@ jobs:
 
                       const result = {
                         summary: String(parsed.summary || '').slice(0, 300),
-                        better_title: String(parsed.better_title || issue.title).slice(0, 200),
+                        better_title: String(parsed.better_title || safeIssueTitle).slice(0, 200),
                         type: allowedType.includes(parsed.type) ? parsed.type : 'Question',
                         negative: (parsed.negative === 'none' || !parsed.negative)
                           ? 'none'
@@ -583,7 +605,7 @@ jobs:
                         WontFix: '[WontFix]',
                         Invalid: '[Invalid]'
                       };
-                      const normalizedTitleCore = String(result.better_title || issue.title || '')
+                      const normalizedTitleCore = String(result.better_title || safeIssueTitle || '')
                         .replace(/^\s*\[[^\]]+\]\s*/g, '')
                         .trim();
                       const safeTitleCore = normalizedTitleCore || '未提供标题';

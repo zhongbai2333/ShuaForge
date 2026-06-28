@@ -1,9 +1,11 @@
 use crate::{
     ai::{
-        AiConfig, AnalysisStreamEvent, AnalysisToolResult, call_learning_gap_analysis_tool,
-        continue_analysis_chat, explain_wrong_answer, load_ai_config, review_answer,
-        save_ai_config, stream_problem_set_analysis_tool,
+        AiConfig, AnalysisStreamEvent, AnalysisToolResult,
+        annotate_problem_knowledge_points_with_progress, call_learning_gap_analysis_tool,
+        continue_analysis_chat, explain_wrong_answer, guide_solution_process, load_ai_config,
+        review_answer, save_ai_config, stream_problem_set_analysis_tool,
     },
+    ai_import::{AiImportResult, import_problem_bank_with_ai},
     deck::{PracticeDeck, PracticeOrder, SubmitResult},
     logging,
     problem::{Problem, ProblemType, load_problems, normalize_choice_answer},
@@ -37,14 +39,14 @@ enum AppView {
     Practice,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum AnalysisKind {
     ProblemSet,
     LearningGap,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct AnalysisCacheKey {
     kind: AnalysisKind,
     title: String,
@@ -118,9 +120,48 @@ struct ChatAsyncResponse {
     message: String,
 }
 
+struct AiImportAsyncResponse {
+    path: PathBuf,
+    result: Result<AiImportResult, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AnalysisProgressState {
+    label: String,
+    current: usize,
+    total: usize,
+}
+
+impl AnalysisProgressState {
+    fn new(label: impl Into<String>, current: usize, total: usize) -> Self {
+        Self {
+            label: label.into(),
+            current,
+            total,
+        }
+    }
+
+    fn fraction(&self) -> f32 {
+        if self.total == 0 {
+            0.0
+        } else {
+            (self.current as f32 / self.total as f32).clamp(0.0, 1.0)
+        }
+    }
+
+    fn text(&self) -> String {
+        if self.total == 0 {
+            self.label.clone()
+        } else {
+            format!("{} · {}/{}", self.label, self.current.min(self.total), self.total)
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 enum UpdateAsyncResponse {
     CheckFinished(Result<Option<UpdateInfo>, String>),
+    ApplyProgress { downloaded: u64, total: u64 },
     ApplyFinished(Result<UpdateOutcome, String>),
 }
 
@@ -365,19 +406,26 @@ pub struct ShuaForgeApp {
     analysis_receiver: Option<mpsc::Receiver<AnalysisAsyncResponse>>,
     analysis_stream_receiver: Option<mpsc::Receiver<AnalysisStreamResponse>>,
     chat_receiver: Option<mpsc::Receiver<ChatAsyncResponse>>,
+    ai_import_receiver: Option<mpsc::Receiver<AiImportAsyncResponse>>,
     update_receiver: Option<mpsc::Receiver<UpdateAsyncResponse>>,
     update_info: Option<UpdateInfo>,
     update_status: String,
+    update_downloaded_bytes: u64,
+    update_total_bytes: u64,
     is_update_checking: bool,
     is_update_applying: bool,
     update_check_source: Option<UpdateCheckSource>,
     show_update_prompt: bool,
     ignored_update_tag: Option<String>,
     analysis_generation_id: u64,
+    analysis_progress: Option<AnalysisProgressState>,
     analysis_dialog: Option<AnalysisDialogState>,
+    analysis_dialogs: HashMap<AnalysisCacheKey, AnalysisDialogState>,
+    active_analysis_key: Option<AnalysisCacheKey>,
     analysis_cache: HashMap<AnalysisCacheKey, AnalysisDialogState>,
     analysis_sources: HashMap<AnalysisCacheKey, AnalysisSource>,
     is_ai_loading: bool,
+    is_ai_importing: bool,
     theme: AppTheme,
     practice_order: PracticeOrder,
     deck_cards: Vec<DeckCard>,
@@ -439,19 +487,26 @@ impl ShuaForgeApp {
             analysis_receiver: None,
             analysis_stream_receiver: None,
             chat_receiver: None,
+            ai_import_receiver: None,
             update_receiver: None,
             update_info: None,
             update_status: "尚未检查更新。".into(),
+            update_downloaded_bytes: 0,
+            update_total_bytes: 0,
             is_update_checking: false,
             is_update_applying: false,
             update_check_source: None,
             show_update_prompt: false,
             ignored_update_tag: update_settings.ignored_tag,
             analysis_generation_id: 0,
+            analysis_progress: None,
             analysis_dialog: None,
+            analysis_dialogs: HashMap::new(),
+            active_analysis_key: None,
             analysis_cache: HashMap::new(),
             analysis_sources: HashMap::new(),
             is_ai_loading: false,
+            is_ai_importing: false,
             theme,
             practice_order,
             deck_cards: Vec::new(),
@@ -563,11 +618,20 @@ impl ShuaForgeApp {
         }
         self.show_update_prompt = false;
         self.is_update_applying = true;
+        self.update_downloaded_bytes = 0;
+        self.update_total_bytes = self.update_info.as_ref().map_or(0, |info| info.size);
         self.update_status = "正在下载并应用更新...".into();
         let (sender, receiver) = mpsc::channel();
         self.update_receiver = Some(receiver);
         thread::spawn(move || {
-            let result = self_update::perform_update(None).map_err(|err| err.to_string());
+            let progress_sender = sender.clone();
+            let on_progress: self_update::ProgressCallback = Box::new(move |downloaded, total| {
+                let _ = progress_sender.send(UpdateAsyncResponse::ApplyProgress {
+                    downloaded,
+                    total,
+                });
+            });
+            let result = self_update::perform_update(Some(on_progress)).map_err(|err| err.to_string());
             let _ = sender.send(UpdateAsyncResponse::ApplyFinished(result));
         });
     }
@@ -600,12 +664,18 @@ impl ShuaForgeApp {
         let Some(receiver) = &self.update_receiver else {
             return;
         };
-        let Ok(response) = receiver.try_recv() else {
+        let mut responses = Vec::new();
+        while let Ok(response) = receiver.try_recv() {
+            responses.push(response);
+        }
+        if responses.is_empty() {
             return;
-        };
-        self.update_receiver = None;
-        match response {
+        }
+        let mut clear_receiver = false;
+        for response in responses {
+            match response {
             UpdateAsyncResponse::CheckFinished(result) => {
+                clear_receiver = true;
                 self.is_update_checking = false;
                 let source = self
                     .update_check_source
@@ -636,7 +706,23 @@ impl ShuaForgeApp {
                     }
                 }
             }
+            UpdateAsyncResponse::ApplyProgress { downloaded, total } => {
+                self.update_downloaded_bytes = downloaded;
+                if total > 0 {
+                    self.update_total_bytes = total;
+                }
+                self.update_status = if self.update_total_bytes > 0 {
+                    format!(
+                        "正在下载更新... {} / {}",
+                        format_bytes(self.update_downloaded_bytes),
+                        format_bytes(self.update_total_bytes)
+                    )
+                } else {
+                    format!("正在下载更新... {}", format_bytes(self.update_downloaded_bytes))
+                };
+            }
             UpdateAsyncResponse::ApplyFinished(result) => {
+                clear_receiver = true;
                 self.is_update_applying = false;
                 match result {
                     Ok(UpdateOutcome::UpToDate) => {
@@ -656,6 +742,10 @@ impl ShuaForgeApp {
                 self.status = self.update_status.clone();
             }
         }
+        }
+        if clear_receiver {
+            self.update_receiver = None;
+        }
     }
 
     fn import_problem_bank(&mut self) {
@@ -671,6 +761,27 @@ impl ShuaForgeApp {
                     self.status = format!("导入失败：{err}");
                 }
             }
+        }
+    }
+
+    fn import_problem_bank_with_ai_dialog(&mut self) {
+        if self.is_ai_importing {
+            self.status = "AI 正在导入题库，请稍候。".into();
+            return;
+        }
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("AI 可解析题库", &["csv", "xlsx", "pdf"])
+            .pick_file()
+        {
+            let config = self.ai_config.clone();
+            let (sender, receiver) = mpsc::channel();
+            self.ai_import_receiver = Some(receiver);
+            self.is_ai_importing = true;
+            self.status = format!("AI 正在解析并导入题库：{}", path.display());
+            thread::spawn(move || {
+                let result = import_problem_bank_with_ai(&config, &path).map_err(|err| err.to_string());
+                let _ = sender.send(AiImportAsyncResponse { path, result });
+            });
         }
     }
 
@@ -700,6 +811,31 @@ impl ShuaForgeApp {
         self.loaded_path = Some(path);
         self.deck = None;
         self.view = AppView::Library;
+    }
+
+    fn poll_ai_import(&mut self) {
+        let Some(receiver) = &self.ai_import_receiver else {
+            return;
+        };
+        let Ok(response) = receiver.try_recv() else {
+            return;
+        };
+        self.ai_import_receiver = None;
+        self.is_ai_importing = false;
+        match response.result {
+            Ok(result) => {
+                let count = result.problems.len();
+                let extracted_chars = result.extracted_chars;
+                self.import_and_load_problems(response.path, result.problems);
+                self.status = format!(
+                    "AI 导入完成：从约 {extracted_chars} 个字符中提取并导入 {count} 道题。"
+                );
+            }
+            Err(err) => {
+                log::error!("AI problem bank import failed: {err}");
+                self.status = format!("AI 导入失败：{err}");
+            }
+        }
     }
 
     fn load_bank_from_store(&mut self) {
@@ -1037,6 +1173,32 @@ impl ShuaForgeApp {
         });
     }
 
+    fn request_solution_guide(&mut self) {
+        let Some(problem) = self.deck.as_ref().and_then(|deck| deck.current()).cloned() else {
+            self.status = "当前没有可讲解的题目。".into();
+            return;
+        };
+
+        if let Some(deck) = &mut self.deck {
+            deck.skip();
+        }
+        self.clear_answer_inputs();
+        self.status = "AI 正在生成不泄答案的做题过程；本题已放回队尾。".into();
+        self.analysis = "AI 引导生成中...".into();
+
+        let config = self.ai_config.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.ai_receiver = Some(receiver);
+        self.is_ai_loading = true;
+        thread::spawn(move || {
+            let message = match guide_solution_process(&config, &problem) {
+                Ok(text) => text,
+                Err(err) => format!("AI 引导失败：{err}"),
+            };
+            let _ = sender.send(message);
+        });
+    }
+
     fn analyze_deck_problems(&mut self, deck_id: i64, deck_name: String) {
         let Some(store) = &self.store else {
             self.status = "本地数据库不可用。".into();
@@ -1104,11 +1266,15 @@ impl ShuaForgeApp {
         };
         self.analysis_sources
             .insert(key.clone(), AnalysisSource::Problems(problems.clone()));
+        self.stash_active_analysis_dialog();
         if let Some(dialog) = self.analysis_cache.get(&key).cloned() {
-            self.analysis_dialog = Some(AnalysisDialogState {
+            let dialog = AnalysisDialogState {
                 open: true,
                 ..dialog
-            });
+            };
+            self.analysis_dialogs.insert(key.clone(), dialog.clone());
+            self.analysis_dialog = Some(dialog);
+            self.active_analysis_key = Some(key);
             self.status = format!("已打开{title}的分析对话。");
             return;
         }
@@ -1116,39 +1282,126 @@ impl ShuaForgeApp {
     }
 
     fn start_problem_set_analysis(&mut self, title: String, problems: Vec<Problem>) {
+        self.finish_active_loading_dialog_as_switched();
         let generation_id = self.next_analysis_generation();
+        let key = AnalysisCacheKey {
+            kind: AnalysisKind::ProblemSet,
+            title: title.clone(),
+        };
         let config = self.ai_config.clone();
         let (sender, receiver) = mpsc::channel();
         self.analysis_stream_receiver = Some(receiver);
-        self.analysis_dialog = Some(AnalysisDialogState::loading(
+        let dialog = AnalysisDialogState::loading(
             title.clone(),
             AnalysisKind::ProblemSet,
             "shuaforge.analyze_problem_set",
             serde_json::json!({
                 "title": title,
                 "problem_count": problems.len(),
-                "data_access": "tool_paging",
-                "available_tools": ["shuaforge.list_problems", "shuaforge.get_problem"],
+                "data_access": "local_compact_full_dataset",
+                "available_tools": ["shuaforge.local_compact_problem_set"],
                 "analysis_dimensions": ["problem_type", "difficulty", "knowledge_points", "practice_order"]
             })
             .to_string(),
-        ));
+        );
+        self.analysis_dialogs.insert(key.clone(), dialog.clone());
+        self.analysis_dialog = Some(dialog);
+        self.active_analysis_key = Some(key);
         self.status = format!("正在分析{title}...");
         self.analysis = "正在生成题目分析，请稍候...".into();
+        self.analysis_progress = Some(AnalysisProgressState::new("准备分析", 0, problems.len()));
 
         thread::spawn(move || {
             let (event_sender, event_receiver) = mpsc::channel();
-            stream_problem_set_analysis_tool(config, title, problems, event_sender);
-            for event in event_receiver {
-                let finished = matches!(event, AnalysisStreamEvent::Finished);
-                let _ = sender.send(AnalysisStreamResponse {
-                    generation_id,
-                    event,
-                });
-                if finished {
-                    break;
+            let forward_sender = sender.clone();
+            let forward_handle = thread::spawn(move || {
+                for event in event_receiver {
+                    let finished = matches!(event, AnalysisStreamEvent::Finished);
+                    let _ = forward_sender.send(AnalysisStreamResponse {
+                        generation_id,
+                        event,
+                    });
+                    if finished {
+                        break;
+                    }
                 }
-            }
+            });
+            let progress_sender = event_sender.clone();
+            let problems = annotate_problem_knowledge_points_with_progress(
+                &config,
+                problems,
+                Some(&move |current, total| {
+                    let _ = progress_sender.send(AnalysisStreamEvent::Progress {
+                        label: "AI 知识点标注".into(),
+                        current,
+                        total,
+                    });
+                }),
+            );
+            let _ = event_sender.send(AnalysisStreamEvent::Progress {
+                label: "整理并压缩题库数据".into(),
+                current: 1,
+                total: 1,
+            });
+            let _ = event_sender.send(AnalysisStreamEvent::KnowledgePointsAnnotated(
+                problems.clone(),
+            ));
+            stream_problem_set_analysis_tool(config, title, problems, event_sender);
+            let _ = forward_handle.join();
+        });
+    }
+
+    fn start_knowledge_point_reanalysis(&mut self) {
+        let Some(dialog) = &self.analysis_dialog else {
+            return;
+        };
+        if dialog.is_loading || dialog.kind != AnalysisKind::ProblemSet {
+            return;
+        }
+        let key = AnalysisCacheKey {
+            kind: dialog.kind,
+            title: dialog.title.clone(),
+        };
+        let Some(AnalysisSource::Problems(problems)) = self.analysis_sources.get(&key).cloned()
+        else {
+            self.status = "当前对话缺少原始题目，无法重分析知识点。".into();
+            return;
+        };
+
+        let generation_id = self.next_analysis_generation();
+        let config = self.ai_config.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.analysis_stream_receiver = Some(receiver);
+        self.analysis_progress = Some(AnalysisProgressState::new("准备重分析知识点", 0, problems.len()));
+        self.status = format!("正在重分析{}的 AI 知识点...", key.title);
+        if let Some(dialog) = &mut self.analysis_dialog {
+            dialog.is_loading = true;
+        }
+
+        thread::spawn(move || {
+            let progress_sender = sender.clone();
+            let problems = annotate_problem_knowledge_points_with_progress(
+                &config,
+                problems,
+                Some(&move |current, total| {
+                    let _ = progress_sender.send(AnalysisStreamResponse {
+                        generation_id,
+                        event: AnalysisStreamEvent::Progress {
+                            label: "AI 知识点重分析".into(),
+                            current,
+                            total,
+                        },
+                    });
+                }),
+            );
+            let _ = sender.send(AnalysisStreamResponse {
+                generation_id,
+                event: AnalysisStreamEvent::KnowledgePointsAnnotated(problems),
+            });
+            let _ = sender.send(AnalysisStreamResponse {
+                generation_id,
+                event: AnalysisStreamEvent::Finished,
+            });
         });
     }
 
@@ -1159,11 +1412,15 @@ impl ShuaForgeApp {
         };
         self.analysis_sources
             .insert(key.clone(), AnalysisSource::Records(records.clone()));
+        self.stash_active_analysis_dialog();
         if let Some(dialog) = self.analysis_cache.get(&key).cloned() {
-            self.analysis_dialog = Some(AnalysisDialogState {
+            let dialog = AnalysisDialogState {
                 open: true,
                 ..dialog
-            });
+            };
+            self.analysis_dialogs.insert(key.clone(), dialog.clone());
+            self.analysis_dialog = Some(dialog);
+            self.active_analysis_key = Some(key);
             self.status = format!("已打开{title}的学习诊断对话。");
             return;
         }
@@ -1171,11 +1428,16 @@ impl ShuaForgeApp {
     }
 
     fn start_learning_gap_analysis(&mut self, title: String, records: Vec<AnswerRecord>) {
+        self.finish_active_loading_dialog_as_switched();
         let generation_id = self.next_analysis_generation();
+        let key = AnalysisCacheKey {
+            kind: AnalysisKind::LearningGap,
+            title: title.clone(),
+        };
         let config = self.ai_config.clone();
         let (sender, receiver) = mpsc::channel();
         self.analysis_receiver = Some(receiver);
-        self.analysis_dialog = Some(AnalysisDialogState::loading(
+        let dialog = AnalysisDialogState::loading(
             title.clone(),
             AnalysisKind::LearningGap,
             "shuaforge.analyze_learning_gaps",
@@ -1186,9 +1448,13 @@ impl ShuaForgeApp {
                 "analysis_dimensions": ["accuracy", "weak_points", "mistake_patterns", "next_practice_plan"]
             })
             .to_string(),
-        ));
+        );
+        self.analysis_dialogs.insert(key.clone(), dialog.clone());
+        self.analysis_dialog = Some(dialog);
+        self.active_analysis_key = Some(key);
         self.status = format!("正在分析{title}的答题表现...");
         self.analysis = "正在生成学习诊断，请稍候...".into();
+        self.analysis_progress = Some(AnalysisProgressState::new("AI 正在生成学习诊断", 0, 0));
 
         thread::spawn(move || {
             let result = match call_learning_gap_analysis_tool(&config, &title, &records) {
@@ -1204,6 +1470,46 @@ impl ShuaForgeApp {
                 result,
             });
         });
+    }
+
+    fn stash_active_analysis_dialog(&mut self) {
+        let Some(dialog) = self.analysis_dialog.take() else {
+            return;
+        };
+        let key = AnalysisCacheKey {
+            kind: dialog.kind,
+            title: dialog.title.clone(),
+        };
+        self.analysis_dialogs.insert(key.clone(), dialog);
+        self.active_analysis_key = Some(key);
+    }
+
+    fn finish_active_loading_dialog_as_switched(&mut self) {
+        let Some(dialog) = &mut self.analysis_dialog else {
+            return;
+        };
+        if !dialog.is_loading {
+            return;
+        }
+        dialog.is_loading = false;
+        if let Some(assistant_message) = dialog.messages.iter_mut().rev().find(|message| {
+            message.role == ChatRole::Assistant && message.content == "正在分析，请稍候..."
+        }) {
+            assistant_message.content = "已切换到新的 AI 分析窗口，本次生成已停止。".into();
+        }
+        self.sync_active_analysis_dialog_to_pool();
+    }
+
+    fn set_active_analysis_dialog(&mut self, key: AnalysisCacheKey) {
+        if self.active_analysis_key.as_ref() == Some(&key) {
+            return;
+        }
+        self.stash_active_analysis_dialog();
+        if let Some(mut dialog) = self.analysis_dialogs.remove(&key) {
+            dialog.open = true;
+            self.analysis_dialog = Some(dialog);
+            self.active_analysis_key = Some(key);
+        }
     }
 
     fn poll_ai(&mut self) {
@@ -1261,7 +1567,44 @@ impl ShuaForgeApp {
         }
         for event in stream_events {
             match event {
+                AnalysisStreamEvent::Progress {
+                    label,
+                    current,
+                    total,
+                } => {
+                    self.analysis_progress = Some(AnalysisProgressState::new(label, current, total));
+                }
+                AnalysisStreamEvent::KnowledgePointsAnnotated(problems) => {
+                    if let Some(store) = &mut self.store {
+                        match store.update_problem_tags(&problems) {
+                            Ok(updated) if updated > 0 => {
+                                self.status = format!("已保存 {updated} 道题的 AI 知识点标签，正在生成分析...");
+                            }
+                            Ok(_) => {
+                                self.status = "AI 知识点标签无需更新，正在生成分析...".into();
+                            }
+                            Err(err) => {
+                                self.status = format!("AI 知识点标签保存失败：{err}");
+                            }
+                        }
+                    }
+                    if let Some(dialog) = &self.analysis_dialog {
+                        let key = AnalysisCacheKey {
+                            kind: dialog.kind,
+                            title: dialog.title.clone(),
+                        };
+                        if matches!(dialog.kind, AnalysisKind::ProblemSet) {
+                            self.analysis_sources
+                                .insert(key, AnalysisSource::Problems(problems));
+                        }
+                    }
+                }
                 AnalysisStreamEvent::ToolCall { arguments_json } => {
+                    self.analysis_progress = Some(AnalysisProgressState::new(
+                        "AI 正在生成分析报告",
+                        0,
+                        0,
+                    ));
                     if let Some(dialog) = &mut self.analysis_dialog
                         && let Some(tool_message) = dialog
                             .messages
@@ -1273,6 +1616,11 @@ impl ShuaForgeApp {
                     }
                 }
                 AnalysisStreamEvent::TextDelta(delta) => {
+                    self.analysis_progress = Some(AnalysisProgressState::new(
+                        "AI 正在生成分析报告",
+                        0,
+                        0,
+                    ));
                     self.analysis.push_str(&delta);
                     if let Some(dialog) = &mut self.analysis_dialog {
                         if let Some(assistant_message) = dialog
@@ -1292,6 +1640,7 @@ impl ShuaForgeApp {
                 }
                 AnalysisStreamEvent::Finished => {
                     self.status = "分析完成。".into();
+                    self.analysis_progress = None;
                     if let Some(dialog) = &mut self.analysis_dialog {
                         dialog.is_loading = false;
                     }
@@ -1301,6 +1650,11 @@ impl ShuaForgeApp {
                 }
                 AnalysisStreamEvent::Failed(reason) => {
                     self.status = format!("AI 分析失败，已尝试回退：{reason}");
+                    self.analysis_progress = Some(AnalysisProgressState::new(
+                        "正在生成本地回退分析",
+                        0,
+                        0,
+                    ));
                 }
             }
         }
@@ -1323,8 +1677,22 @@ impl ShuaForgeApp {
                 dialog.is_loading = false;
                 self.cache_current_analysis_dialog();
             }
+            self.analysis_progress = None;
             self.chat_receiver = None;
         }
+        self.sync_active_analysis_dialog_to_pool();
+    }
+
+    fn sync_active_analysis_dialog_to_pool(&mut self) {
+        let Some(dialog) = &self.analysis_dialog else {
+            return;
+        };
+        let key = AnalysisCacheKey {
+            kind: dialog.kind,
+            title: dialog.title.clone(),
+        };
+        self.analysis_dialogs.insert(key.clone(), dialog.clone());
+        self.active_analysis_key = Some(key);
     }
 
     fn cache_current_analysis_dialog(&mut self) {
@@ -1352,6 +1720,7 @@ impl ShuaForgeApp {
         self.analysis_receiver = None;
         self.analysis_stream_receiver = None;
         self.chat_receiver = None;
+        self.analysis_progress = None;
         if let Some(dialog) = &mut self.analysis_dialog {
             dialog.is_loading = false;
             if let Some(assistant_message) = dialog.messages.iter_mut().rev().find(|message| {
@@ -1477,6 +1846,16 @@ impl ShuaForgeApp {
         ui.horizontal_wrapped(|ui| {
             if ui.button("导入新题库").clicked() {
                 self.import_problem_bank();
+            }
+            if ui
+                .add_enabled(!self.is_ai_importing, egui::Button::new("AI导入题库"))
+                .clicked()
+            {
+                self.import_problem_bank_with_ai_dialog();
+            }
+            if self.is_ai_importing {
+                ui.spinner();
+                ui.label("AI 导入中");
             }
             if ui.button("练习全部题库").clicked() {
                 self.restart_from_store();
@@ -1683,6 +2062,35 @@ impl ShuaForgeApp {
     }
 
     fn render_analysis_dialog(&mut self, ctx: &egui::Context) {
+        let active_before_render = self.active_analysis_key.clone();
+        let mut keys = self.analysis_dialogs.keys().cloned().collect::<Vec<_>>();
+        if let Some(dialog) = &self.analysis_dialog {
+            let key = AnalysisCacheKey {
+                kind: dialog.kind,
+                title: dialog.title.clone(),
+            };
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+        keys.sort_by(|left, right| {
+            left.kind
+                .cmp(&right.kind)
+                .then_with(|| left.title.cmp(&right.title))
+        });
+        for key in keys {
+            self.render_one_analysis_dialog(ctx, key);
+        }
+        if let Some(key) = active_before_render
+            && self.active_analysis_key.as_ref() != Some(&key)
+            && self.analysis_dialogs.contains_key(&key)
+        {
+            self.set_active_analysis_dialog(key);
+        }
+    }
+
+    fn render_one_analysis_dialog(&mut self, ctx: &egui::Context, key: AnalysisCacheKey) {
+        self.set_active_analysis_dialog(key.clone());
         let Some(dialog) = &self.analysis_dialog else {
             return;
         };
@@ -1692,11 +2100,18 @@ impl ShuaForgeApp {
         };
         let mut send_message = false;
         let mut new_dialog_requested = false;
+        let mut knowledge_reanalysis_requested = false;
         let mut should_close = false;
-        let viewport_id = egui::ViewportId::from_hash_of("shuaforge_analysis_dialog");
+        let viewport_id = egui::ViewportId::from_hash_of(("shuaforge_analysis_dialog", &key));
+        let window_index = self
+            .analysis_dialogs
+            .keys()
+            .filter(|existing| *existing < &key)
+            .count() as f32;
         let builder = egui::ViewportBuilder::default()
             .with_title(title)
             .with_inner_size([660.0, 560.0])
+            .with_position([80.0 + window_index * 28.0, 80.0 + window_index * 28.0])
             .with_min_inner_size([520.0, 420.0])
             .with_resizable(true);
 
@@ -1705,7 +2120,7 @@ impl ShuaForgeApp {
                 should_close = true;
             }
 
-            let mut render_content = |ui: &mut egui::Ui| {
+            let render_content = |ui: &mut egui::Ui| {
                 if let Some(dialog) = &mut self.analysis_dialog {
                     ui.horizontal(|ui| {
                         ui.heading("对话");
@@ -1720,8 +2135,19 @@ impl ShuaForgeApp {
                             {
                                 new_dialog_requested = true;
                             }
+                            if dialog.kind == AnalysisKind::ProblemSet
+                                && ui
+                                    .add_enabled(
+                                        !dialog.is_loading,
+                                        egui::Button::new("AI知识点重分析"),
+                                    )
+                                    .clicked()
+                            {
+                                knowledge_reanalysis_requested = true;
+                            }
                         });
                     });
+                    render_analysis_progress_bar(ui, self.analysis_progress.as_ref());
                     ui.separator();
 
                     let input_area_height = 126.0;
@@ -1753,11 +2179,7 @@ impl ShuaForgeApp {
 
             match class {
                 egui::ViewportClass::Embedded => {
-                    egui::Window::new("分析对话")
-                        .resizable(true)
-                        .default_width(660.0)
-                        .default_height(560.0)
-                        .show(ctx, &mut render_content);
+                    egui::CentralPanel::default().show(ctx, render_content);
                 }
                 egui::ViewportClass::Root
                 | egui::ViewportClass::Deferred
@@ -1768,17 +2190,10 @@ impl ShuaForgeApp {
         });
         if let Some(dialog) = &mut self.analysis_dialog {
             dialog.open = !should_close;
+            self.analysis_dialogs.insert(key.clone(), dialog.clone());
         }
         if should_close {
-            if self
-                .analysis_dialog
-                .as_ref()
-                .is_some_and(|dialog| dialog.is_loading)
-            {
-                self.cancel_analysis_work();
-            } else {
-                self.cache_current_analysis_dialog();
-            }
+            self.close_analysis_dialog_by_key(&key);
         }
         if send_message {
             if self
@@ -1794,10 +2209,44 @@ impl ShuaForgeApp {
         if new_dialog_requested {
             self.start_new_analysis_dialog();
         }
-        if let Some(dialog) = &self.analysis_dialog
-            && !dialog.open
-            && !dialog.is_loading
+        if knowledge_reanalysis_requested {
+            self.start_knowledge_point_reanalysis();
+        }
+        if self
+            .analysis_dialogs
+            .get(&key)
+            .is_some_and(|dialog| !dialog.open && !dialog.is_loading)
         {
+            self.close_analysis_dialog_by_key(&key);
+        }
+    }
+
+    fn close_analysis_dialog_by_key(&mut self, key: &AnalysisCacheKey) {
+        let mut dialog = if self.active_analysis_key.as_ref() == Some(key) {
+            self.analysis_dialog.take()
+        } else {
+            self.analysis_dialogs.remove(key)
+        };
+        if let Some(dialog) = dialog.as_mut() {
+            dialog.open = false;
+            if dialog.is_loading {
+                dialog.is_loading = false;
+                if let Some(assistant_message) = dialog.messages.iter_mut().rev().find(|message| {
+                    message.role == ChatRole::Assistant
+                        && (message.content == "正在分析，请稍候..."
+                            || message.content == "正在回复，请稍候...")
+                }) {
+                    assistant_message.content = "此 AI 分析窗口已关闭。".into();
+                }
+            }
+            let mut cached = dialog.clone();
+            cached.open = false;
+            self.analysis_cache.insert(key.clone(), cached);
+            self.persist_analysis_cache();
+        }
+        self.analysis_dialogs.remove(key);
+        if self.active_analysis_key.as_ref() == Some(key) {
+            self.active_analysis_key = None;
             self.analysis_dialog = None;
         }
     }
@@ -1843,6 +2292,21 @@ impl ShuaForgeApp {
                 ui.separator();
                 ui.heading("更新");
                 ui.label(&self.update_status);
+                if self.is_update_checking {
+                    ui.add(
+                        egui::ProgressBar::new(0.3)
+                            .animate(true)
+                            .desired_width(ui.available_width())
+                            .text("正在检查更新..."),
+                    );
+                }
+                if self.is_update_applying {
+                    render_update_progress_bar(
+                        ui,
+                        self.update_downloaded_bytes,
+                        self.update_total_bytes,
+                    );
+                }
                 ui.horizontal_wrapped(|ui| {
                     if ui
                         .add_enabled(
@@ -1916,6 +2380,15 @@ impl ShuaForgeApp {
                     ui.small(format!("Release：{}", info.release_name));
                 }
                 ui.small(format!("资产：{}", info.asset_name));
+                if self.is_update_applying {
+                    ui.add_space(8.0);
+                    ui.label(&self.update_status);
+                    render_update_progress_bar(
+                        ui,
+                        self.update_downloaded_bytes,
+                        self.update_total_bytes,
+                    );
+                }
                 ui.add_space(8.0);
                 ui.horizontal_wrapped(|ui| {
                     if ui
@@ -2342,6 +2815,57 @@ fn strip_markdown_inline(text: &str) -> String {
     text.replace("**", "").replace('`', "")
 }
 
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB"];
+    let mut value = bytes as f64;
+    let mut unit_index = 0usize;
+    while value >= 1024.0 && unit_index + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit_index += 1;
+    }
+    if unit_index == 0 {
+        format!("{} {}", bytes, UNITS[unit_index])
+    } else {
+        format!("{value:.1} {}", UNITS[unit_index])
+    }
+}
+
+fn render_update_progress_bar(ui: &mut egui::Ui, downloaded: u64, total: u64) {
+    if total > 0 {
+        let progress = (downloaded as f32 / total as f32).clamp(0.0, 1.0);
+        ui.add(
+            egui::ProgressBar::new(progress)
+                .desired_width(ui.available_width())
+                .text(format!("下载进度 {:.0}%", progress * 100.0)),
+        );
+    } else {
+        ui.add(
+            egui::ProgressBar::new(0.35)
+                .animate(true)
+                .desired_width(ui.available_width())
+                .text("正在下载..."),
+        );
+    }
+}
+
+fn render_analysis_progress_bar(ui: &mut egui::Ui, progress: Option<&AnalysisProgressState>) {
+    let Some(progress) = progress else { return };
+    if progress.total == 0 {
+        ui.add(
+            egui::ProgressBar::new(0.6)
+                .animate(true)
+                .desired_width(ui.available_width())
+                .text(progress.text()),
+        );
+    } else {
+        ui.add(
+            egui::ProgressBar::new(progress.fraction())
+                .desired_width(ui.available_width())
+                .text(progress.text()),
+        );
+    }
+}
+
 fn grid_columns(ui: &egui::Ui, card_width: f32) -> usize {
     let gap = 12.0;
     ((ui.available_width() + gap) / (card_width + gap))
@@ -2370,8 +2894,16 @@ fn load_persisted_update_settings(
 impl eframe::App for ShuaForgeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_ai();
+        self.poll_ai_import();
         self.poll_update();
         if self.is_ai_loading {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        if self
+            .analysis_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.is_loading)
+        {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         if self.is_update_checking || self.is_update_applying {
@@ -2453,11 +2985,24 @@ impl eframe::App for ShuaForgeApp {
                             ui.label("Model");
                             settings_changed |=
                                 ui.text_edit_singleline(&mut self.ai_config.model).changed();
+                            ui.label("Fast Model（知识点预标注，可填 DeepSeek-v4-flash）");
+                            settings_changed |= ui
+                                .text_edit_singleline(&mut self.ai_config.fast_model)
+                                .changed();
                             ui.label("API Key（仅保存在本机 SQLite 设置中）");
                             settings_changed |= ui
                                 .add(
                                     egui::TextEdit::singleline(&mut self.ai_config.api_key)
                                         .password(true),
+                                )
+                                .changed();
+                            settings_changed |= ui
+                                .add(
+                                    egui::Slider::new(
+                                        &mut self.ai_config.knowledge_point_concurrency,
+                                        1..=6,
+                                    )
+                                    .text("知识点并发"),
                                 )
                                 .changed();
                             settings_changed |= ui
@@ -2493,7 +3038,7 @@ impl eframe::App for ShuaForgeApp {
                                 match userscript_server::open_userscript_install_page() {
                                     Ok(url) => {
                                         self.status = format!(
-                                            "已在浏览器打开脚本安装页：{url}。如果没有弹出安装页，请确认已安装 Tampermonkey / Violentmonkey / 脚本猫。"
+                                            "已在浏览器打开 Tampermonkey 官方脚本安装页：{url}。如果中转页卡住或下载 .js，请把 Tampermonkey 的“网站访问权限”设为“在所有网站上”。"
                                         );
                                     }
                                     Err(err) => {
@@ -2502,7 +3047,7 @@ impl eframe::App for ShuaForgeApp {
                                 }
                             }
                             ui.small(
-                                "会启动本机 127.0.0.1 临时服务并打开 .user.js 安装页；浏览器扩展仍需要你确认安装。",
+                                "会启动本机 127.0.0.1 临时服务，并通过 Tampermonkey 官方安装页读取 .user.js；浏览器扩展仍需要你确认安装。",
                             );
 
                             ui.collapsing("答题历史", |ui| {
@@ -2524,6 +3069,7 @@ impl eframe::App for ShuaForgeApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             let mut submit_requested = false;
             let mut skip_requested = false;
+            let mut solution_guide_requested = false;
             let mut back_to_library_requested = false;
 
             if self.view == AppView::Practice {
@@ -2542,6 +3088,17 @@ impl eframe::App for ShuaForgeApp {
                     ui.label(format!("答对：{}", stats.correct));
                     ui.label(format!("答错：{}", stats.wrong));
                 });
+                let completed = stats.correct + stats.wrong;
+                let progress = if stats.total == 0 {
+                    0.0
+                } else {
+                    completed as f32 / stats.total as f32
+                };
+                ui.add(
+                    egui::ProgressBar::new(progress)
+                        .desired_width(ui.available_width())
+                        .text(format!("经验值 Lv.{} · {completed}/{}", stats.correct / 10 + 1, stats.total)),
+                );
                 ui.separator();
 
                 if deck.is_finished() {
@@ -2577,6 +3134,9 @@ impl eframe::App for ShuaForgeApp {
                         if ui.button("提交答案").clicked() || submit_shortcut {
                             submit_requested = true;
                         }
+                        if ui.button("AI 引导解题（不看答案）").clicked() {
+                            solution_guide_requested = true;
+                        }
                         if ui.button("跳过并放回队尾").clicked() {
                             skip_requested = true;
                         }
@@ -2594,6 +3154,9 @@ impl eframe::App for ShuaForgeApp {
             if submit_requested {
                 self.submit_answer();
             }
+            if solution_guide_requested {
+                self.request_solution_guide();
+            }
             if back_to_library_requested {
                 self.back_to_library();
             }
@@ -2609,6 +3172,7 @@ impl eframe::App for ShuaForgeApp {
             } else {
                 "解析与分析"
             });
+            render_analysis_progress_bar(ui, self.analysis_progress.as_ref());
             egui::ScrollArea::vertical()
                 .id_salt("wrong_answer_analysis")
                 .max_height(220.0)

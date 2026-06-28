@@ -16,6 +16,10 @@ pub struct AiConfig {
     pub endpoint: String,
     pub api_key: String,
     pub model: String,
+    #[serde(default)]
+    pub fast_model: String,
+    #[serde(default = "default_knowledge_point_concurrency")]
+    pub knowledge_point_concurrency: usize,
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
 }
@@ -29,6 +33,12 @@ pub struct AnalysisToolResult {
 
 #[derive(Debug, Clone)]
 pub enum AnalysisStreamEvent {
+    Progress {
+        label: String,
+        current: usize,
+        total: usize,
+    },
+    KnowledgePointsAnnotated(Vec<Problem>),
     ToolCall { arguments_json: String },
     TextDelta(String),
     Finished,
@@ -42,6 +52,8 @@ impl Default for AiConfig {
             endpoint: String::new(),
             api_key: String::new(),
             model: String::new(),
+            fast_model: String::new(),
+            knowledge_point_concurrency: default_knowledge_point_concurrency(),
             timeout_secs: default_timeout_secs(),
         }
     }
@@ -67,6 +79,7 @@ struct ChatCompletionMessage<'a> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 struct ProblemSetToolRequest {
     tool: String,
     #[serde(default)]
@@ -78,6 +91,7 @@ struct ProblemSetToolRequest {
 }
 
 #[derive(Debug, Serialize)]
+#[allow(dead_code)]
 struct ProblemBatchResponse<'a> {
     cursor: usize,
     limit: usize,
@@ -90,6 +104,7 @@ struct ProblemBatchResponse<'a> {
 }
 
 #[derive(Debug, Serialize)]
+#[allow(dead_code)]
 struct ProblemPreview<'a> {
     id: &'a str,
     problem_type: String,
@@ -263,6 +278,139 @@ pub fn review_answer(
         .ok_or_else(|| "AI 响应为空".into())
 }
 
+pub fn guide_solution_process(
+    config: &AiConfig,
+    problem: &Problem,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    if !config.enabled {
+        log::info!("AI solution guide skipped: disabled, problem_id={}", problem.id);
+        return Ok(local_solution_guide(problem));
+    }
+
+    if config.endpoint.trim().is_empty() || config.model.trim().is_empty() {
+        log::warn!(
+            "AI solution guide skipped: endpoint/model missing, problem_id={}",
+            problem.id
+        );
+        return Ok("AI 引导需要先启用并填写 endpoint/model。".into());
+    }
+
+    send_prompt(config, build_solution_guide_prompt(problem))
+}
+
+#[allow(dead_code)]
+pub fn annotate_problem_knowledge_points(
+    config: &AiConfig,
+    problems: Vec<Problem>,
+) -> Vec<Problem> {
+    annotate_problem_knowledge_points_with_progress(config, problems, None)
+}
+
+pub fn annotate_problem_knowledge_points_with_progress(
+    config: &AiConfig,
+    problems: Vec<Problem>,
+    on_progress: Option<&dyn Fn(usize, usize)>,
+) -> Vec<Problem> {
+    let total = problems.len();
+    if problems.is_empty() || !config.enabled || config.endpoint.trim().is_empty() {
+        if let Some(callback) = on_progress {
+            callback(total, total);
+        }
+        return problems;
+    }
+
+    let model = config
+        .fast_model
+        .trim()
+        .is_empty()
+        .then(|| config.model.clone())
+        .unwrap_or_else(|| config.fast_model.trim().to_owned());
+    if model.trim().is_empty() {
+        return problems;
+    }
+
+    let concurrency = config.knowledge_point_concurrency.clamp(1, 6);
+    let mut handles = Vec::new();
+    let mut annotated = Vec::with_capacity(problems.len());
+    let mut completed = 0usize;
+
+    if let Some(callback) = on_progress {
+        callback(0, total);
+    }
+
+    for problem in problems {
+        let mut task_config = config.clone();
+        task_config.model = model.clone();
+        let handle = std::thread::spawn(move || annotate_one_problem(task_config, problem));
+        handles.push(handle);
+        if handles.len() >= concurrency {
+            completed += join_annotation_handles(&mut handles, &mut annotated);
+            if let Some(callback) = on_progress {
+                callback(completed, total);
+            }
+        }
+    }
+    completed += join_annotation_handles(&mut handles, &mut annotated);
+    if let Some(callback) = on_progress {
+        callback(completed, total);
+    }
+    annotated
+}
+
+fn join_annotation_handles(
+    handles: &mut Vec<std::thread::JoinHandle<Problem>>,
+    annotated: &mut Vec<Problem>,
+) -> usize {
+    let mut joined = 0usize;
+    for handle in std::mem::take(handles) {
+        if let Ok(problem) = handle.join() {
+            annotated.push(problem);
+        }
+        joined += 1;
+    }
+    joined
+}
+
+fn annotate_one_problem(config: AiConfig, mut problem: Problem) -> Problem {
+    problem
+        .tags
+        .retain(|tag| !tag.trim_start().starts_with("AI知识点:"));
+    let prompt = build_knowledge_point_prompt(&problem);
+    match send_prompt(&config, prompt) {
+        Ok(text) => {
+            for point in parse_knowledge_points(&text) {
+                let tag = format!("AI知识点:{point}");
+                if !problem.tags.iter().any(|existing| existing == &tag) {
+                    problem.tags.push(tag);
+                }
+            }
+        }
+        Err(err) => log::warn!(
+            "Knowledge point annotation failed: problem_id={}, error={err}",
+            problem.id
+        ),
+    }
+    problem
+}
+
+fn build_knowledge_point_prompt(problem: &Problem) -> String {
+    format!(
+        "请判断这道题最核心的 1-3 个知识点。只输出知识点名称，用中文逗号分隔；不要解释，不要输出答案。\n\n要求：\n- 不要推理过程。\n- 每个知识点尽量不超过 10 个字。\n- 不要输出选项字母或答案内容。\n\n题目：{}",
+        problem.prompt
+    )
+}
+
+fn parse_knowledge_points(text: &str) -> Vec<String> {
+    text.replace(['\n', '、', ';', '；'], ",")
+        .split(',')
+        .map(|item| item.trim().trim_start_matches('-').trim())
+        .filter(|item| !item.is_empty())
+        .filter(|item| item.chars().count() <= 24)
+        .take(3)
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
 #[allow(dead_code)]
 pub fn analyze_problem_set(
     config: &AiConfig,
@@ -300,8 +448,8 @@ pub fn call_problem_set_analysis_tool(
     let arguments = json!({
         "title": title,
         "problem_count": problems.len(),
-        "data_access": "tool_paging",
-        "available_tools": ["shuaforge.list_problems", "shuaforge.get_problem"],
+        "data_access": "local_compact_full_dataset",
+        "available_tools": ["shuaforge.local_compact_problem_set"],
         "analysis_dimensions": ["problem_type", "difficulty", "knowledge_points", "practice_order"]
     });
 
@@ -321,8 +469,8 @@ pub fn stream_problem_set_analysis_tool(
     let arguments = json!({
         "title": title,
         "problem_count": problems.len(),
-        "data_access": "tool_paging",
-        "available_tools": ["shuaforge.list_problems", "shuaforge.get_problem"],
+        "data_access": "local_compact_full_dataset",
+        "available_tools": ["shuaforge.local_compact_problem_set"],
         "stream": true,
         "analysis_dimensions": ["problem_type", "difficulty", "knowledge_points", "practice_order"]
     });
@@ -473,6 +621,14 @@ fn build_review_prompt(problem: &Problem, user_answer: &str) -> String {
     )
 }
 
+fn build_solution_guide_prompt(problem: &Problem) -> String {
+    format!(
+        "你是 ShuaForge 的刷题引导助手，不要自称老师。请讲解这道题的做题过程，但绝对不要直接给出最终答案或选项字母。\n\n要求：\n1. 不输出标准答案，不说“答案是X”。\n2. 用步骤引导用户如何排除干扰项、抓关键词、判断考点。\n3. 最后给一个“请你根据以上步骤自行选择”的提醒。\n4. 如果题库里保存了答案，也只能把它当作内部参考，不能泄露。\n\n题目：{}\n\n内部参考答案（禁止输出）：{}",
+        problem.prompt,
+        problem.answer
+    )
+}
+
 fn send_prompt(config: &AiConfig, prompt: String) -> Result<String, Box<dyn Error + Send + Sync>> {
     let body = build_ai_request_body(config, prompt)?;
     let started = log_ai_request_start("send_prompt", config, &body, false);
@@ -605,12 +761,18 @@ fn send_chat_messages_streaming(
         )))
         .build()
         .new_agent();
-    let mut request = match agent
+    let mut request_builder = agent
         .post(&config.endpoint)
         .header("content-type", "application/json")
-        .header("accept", "text/event-stream")
-        .send(body)
-    {
+        .header("accept", "text/event-stream");
+    if !config.api_key.trim().is_empty() {
+        request_builder = request_builder.header(
+            "authorization",
+            format!("Bearer {}", config.api_key.trim()),
+        );
+    }
+
+    let mut request = match request_builder.send(body) {
         Ok(response) => response,
         Err(err) => {
             log_ai_transport_error("send_chat_messages_streaming", started, &err);
@@ -726,48 +888,23 @@ fn analyze_problem_set_with_tools(
     title: &str,
     problems: &[Problem],
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
-    let mut messages = vec![
+    let messages = vec![
         ChatCompletionMessage {
             role: "system",
-            content: problem_set_analysis_system_prompt(),
+            content: compact_problem_set_analysis_system_prompt(),
         },
         ChatCompletionMessage {
             role: "user",
-            content: build_problem_set_analysis_prompt(title, problems),
+            content: build_compact_problem_set_analysis_prompt(title, problems),
         },
     ];
-
-    for _ in 0..8 {
-        let response = send_chat_messages(config, clone_chat_messages(&messages))?;
-        let Some(request) = parse_problem_set_tool_request(&response) else {
-            log::info!(
-                "Problem set tool analysis finished without further tool call: title={}, messages={}",
-                title,
-                messages.len()
-            );
-            return Ok(response);
-        };
-
-        log::info!(
-            "Problem set tool request parsed: title={}, tool={}, cursor={}, limit={}, id_present={}",
-            title,
-            request.tool,
-            request.cursor,
-            request.limit,
-            request.id.is_some()
-        );
-        let tool_result = execute_problem_set_tool(problems, &request)?;
-        messages.push(ChatCompletionMessage {
-            role: "assistant",
-            content: response,
-        });
-        messages.push(ChatCompletionMessage {
-            role: "system",
-            content: tool_result,
-        });
-    }
-
-    Ok("AI 已多次请求题目数据但未生成最终报告。请缩小题组范围或稍后重试。".into())
+    log::info!(
+        "Problem set compact analysis request prepared: title={}, problems={}, prompt_chars={}",
+        title,
+        problems.len(),
+        messages.iter().map(|message| message.content.chars().count()).sum::<usize>()
+    );
+    send_chat_messages(config, messages)
 }
 
 fn analyze_problem_set_with_tools_streaming(
@@ -776,49 +913,34 @@ fn analyze_problem_set_with_tools_streaming(
     problems: &[Problem],
     sender: &mpsc::Sender<AnalysisStreamEvent>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let mut messages = vec![
+    let compact_prompt = build_compact_problem_set_analysis_prompt(title, problems);
+    let _ = sender.send(AnalysisStreamEvent::ToolCall {
+        arguments_json: json!({
+            "tool": "shuaforge.local_compact_problem_set",
+            "title": title,
+            "problem_count": problems.len(),
+            "data_access": "local_compact_full_dataset",
+            "prompt_chars": compact_prompt.chars().count()
+        })
+        .to_string(),
+    });
+
+    let messages = vec![
         ChatCompletionMessage {
             role: "system",
-            content: problem_set_analysis_system_prompt(),
+            content: compact_problem_set_analysis_system_prompt(),
         },
         ChatCompletionMessage {
             role: "user",
-            content: build_problem_set_analysis_prompt(title, problems),
+            content: compact_prompt,
         },
     ];
-
-    for _ in 0..8 {
-        let response = send_chat_messages(config, clone_chat_messages(&messages))?;
-        let Some(request) = parse_problem_set_tool_request(&response) else {
-            log::info!(
-                "Problem set streaming tool analysis finished without further tool call: title={}, messages={}",
-                title,
-                messages.len()
-            );
-            let _ = sender.send(AnalysisStreamEvent::TextDelta(response));
-            let _ = sender.send(AnalysisStreamEvent::Finished);
-            return Ok(());
-        };
-
-        log::info!(
-            "Problem set streaming tool request parsed: title={}, tool={}, cursor={}, limit={}, id_present={}",
-            title,
-            request.tool,
-            request.cursor,
-            request.limit,
-            request.id.is_some()
-        );
-        let tool_result = execute_problem_set_tool(problems, &request)?;
-        messages.push(ChatCompletionMessage {
-            role: "assistant",
-            content: response,
-        });
-        messages.push(ChatCompletionMessage {
-            role: "system",
-            content: tool_result,
-        });
-    }
-
+    log::info!(
+        "Problem set compact streaming request prepared: title={}, problems={}, prompt_chars={}",
+        title,
+        problems.len(),
+        messages.iter().map(|message| message.content.chars().count()).sum::<usize>()
+    );
     let mut emitted = false;
     send_chat_messages_streaming(config, clone_chat_messages(&messages), |delta| {
         emitted = true;
@@ -850,10 +972,12 @@ fn clone_chat_messages(
         .collect()
 }
 
+#[allow(dead_code)]
 fn default_problem_batch_limit() -> usize {
     30
 }
 
+#[allow(dead_code)]
 fn build_problem_set_analysis_prompt(title: &str, problems: &[Problem]) -> String {
     let stats = problem_set_stats(problems);
 
@@ -863,10 +987,111 @@ fn build_problem_set_analysis_prompt(title: &str, problems: &[Problem]) -> Strin
     )
 }
 
+#[allow(dead_code)]
 fn problem_set_analysis_system_prompt() -> String {
     "你是 ShuaForge 的刷题助手，不要自称老师。\n\n这是一个两阶段任务：\n1. 先读取题库数据。\n2. 只有在已通过工具读取完全部题目后，才能输出最终 Markdown 报告。\n\n强制规则：\n- 如果还没读完全部题目，不要给最终分析，不要总结，不要推断难度和易混点。\n- 每次只能请求一页题目，且 `limit` 不超过 50。\n- 当工具结果里的 `next_cursor` 不是 null 时，说明还有未读取题目，必须继续请求下一页。\n- 只有当 `next_cursor` 为 null 且已读取题目数等于题库总数时，才能输出最终报告。\n- 最终报告中的“数据读取范围”必须明确写出是否已读取全部题目。\n- 题型数量和标签频次只能使用题库总览中的全量统计。\n- 難度、易混点、刷题顺序必须基于全部已读取题目，而不是少量样本。\n- 不要因为第一页数据足够就提前结束；题库有多少题，就尽量把全部页都读完。\n\n工具协议：\n- 拉取题目列表：只回复 JSON {\"tool\":\"shuaforge.list_problems\",\"cursor\":0,\"limit\":50}\n- 拉取单题详情：只回复 JSON {\"tool\":\"shuaforge.get_problem\",\"id\":\"题目ID\"}\n- 程序会把工具结果作为 system 消息插回对话；你应读取 system 消息后继续下一步。\n- 如果需要下一页，请使用上一次返回的 next_cursor 作为 cursor。".to_owned()
 }
 
+fn compact_problem_set_analysis_system_prompt() -> String {
+    "你是 ShuaForge 的刷题助手，不要自称老师。程序已经在本地读取完全部题目，并提供了全量统计、标签频次和压缩后的逐题摘要。请直接输出最终 Markdown 分析报告。\n\n要求：\n- 明确写出“数据读取范围：已读取全部题目”。\n- 题型数量、标签频次必须使用用户消息中的全量统计，不要重新猜测。\n- 难度、易混点、刷题顺序只能基于压缩摘要做审慎观察，不能编造不存在的题目。\n- 对“无标准答案/按得分推断/待复核”的数据质量限制要单独说明。\n- 输出结构建议包含：概览、数据质量、题型与标签、易错/待复核重点、刷题顺序、下一步建议。".to_owned()
+}
+
+fn build_compact_problem_set_analysis_prompt(title: &str, problems: &[Problem]) -> String {
+    let stats = problem_set_stats(problems);
+    let score_summary = score_inference_summary(problems);
+    let examples = compact_problem_examples(problems, 80);
+
+    format!(
+        "题组/题库「{title}」已经由程序本地读取完全部题目，请直接生成最终分析报告。\n\n数据读取范围：已读取全部题目（{} / {}）。\n\n题库总览：\n{stats}\n\n得分/复核摘要：\n{score_summary}\n\n压缩逐题摘要（最多 80 条，覆盖题型和待复核样例；完整统计以上方总览为准）：\n{examples}",
+        problems.len(),
+        problems.len()
+    )
+}
+
+fn score_inference_summary(problems: &[Problem]) -> String {
+    let mut correct = 0usize;
+    let mut wrong = 0usize;
+    let mut review = 0usize;
+    let mut score_tags = std::collections::BTreeMap::<String, usize>::new();
+
+    for problem in problems {
+        if problem.tags.iter().any(|tag| tag == "作答正确") {
+            correct += 1;
+        }
+        if problem.tags.iter().any(|tag| tag == "作答错误") {
+            wrong += 1;
+        }
+        if problem.needs_ai_review() {
+            review += 1;
+        }
+        for tag in &problem.tags {
+            if tag.starts_with("本题得分:") {
+                *score_tags.entry(tag.clone()).or_default() += 1;
+            }
+        }
+    }
+
+    let scores = score_tags
+        .into_iter()
+        .map(|(score, count)| format!("{score}({count})"))
+        .collect::<Vec<_>>()
+        .join("、");
+
+    format!(
+        "- 按得分推断正确：{correct}\n- 按得分推断错误：{wrong}\n- 需要 AI/人工复核：{review}\n- 分数标签分布：{}",
+        if scores.is_empty() { "暂无" } else { &scores }
+    )
+}
+
+fn compact_problem_examples(problems: &[Problem], limit: usize) -> String {
+    let mut selected = Vec::new();
+    selected.extend(
+        problems
+            .iter()
+            .filter(|problem| problem.needs_ai_review())
+            .take(limit / 2),
+    );
+    let selected_ids = selected
+        .iter()
+        .map(|problem: &&Problem| problem.id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    selected.extend(problems.iter().filter(|problem| {
+        !problem.needs_ai_review() && !selected_ids.contains(problem.id.as_str())
+    }));
+
+    selected
+        .into_iter()
+        .take(limit)
+        .enumerate()
+        .map(|(index, problem)| {
+            let tags = if problem.tags.is_empty() {
+                "无".to_owned()
+            } else {
+                problem.tags.iter().take(6).cloned().collect::<Vec<_>>().join("/")
+            };
+            format!(
+                "{}. [{}] {} | 答案:{} | 标签:{}",
+                index + 1,
+                format!("{:?}", problem.kind()),
+                summarize_for_prompt(&problem.question_text(), 80),
+                summarize_for_prompt(&problem.answer, 24),
+                tags
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn summarize_for_prompt(value: &str, max_chars: usize) -> String {
+    let text = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.chars().count() <= max_chars {
+        text
+    } else {
+        format!("{}...", text.chars().take(max_chars).collect::<String>())
+    }
+}
+
+#[allow(dead_code)]
 fn parse_problem_set_tool_request(text: &str) -> Option<ProblemSetToolRequest> {
     json_candidates(text).into_iter().find_map(|candidate| {
         let request = serde_json::from_str::<ProblemSetToolRequest>(&candidate).ok()?;
@@ -881,6 +1106,7 @@ fn parse_problem_set_tool_request(text: &str) -> Option<ProblemSetToolRequest> {
     })
 }
 
+#[allow(dead_code)]
 fn json_candidates(text: &str) -> Vec<String> {
     let trimmed = text.trim();
     let mut candidates = vec![trimmed.to_owned()];
@@ -908,6 +1134,7 @@ fn parse_sse_content_delta(data: &str) -> Option<String> {
     })
 }
 
+#[allow(dead_code)]
 fn execute_problem_set_tool(
     problems: &[Problem],
     request: &ProblemSetToolRequest,
@@ -919,6 +1146,7 @@ fn execute_problem_set_tool(
     }
 }
 
+#[allow(dead_code)]
 fn list_problem_batch(
     problems: &[Problem],
     cursor: usize,
@@ -948,6 +1176,7 @@ fn list_problem_batch(
     Ok(serde_json::to_string_pretty(&response)?)
 }
 
+#[allow(dead_code)]
 fn get_problem_detail(
     problems: &[Problem],
     id: Option<&str>,
@@ -961,6 +1190,7 @@ fn get_problem_detail(
     Ok(serde_json::to_string_pretty(&problem_preview(problem))?)
 }
 
+#[allow(dead_code)]
 fn problem_preview(problem: &Problem) -> ProblemPreview<'_> {
     ProblemPreview {
         id: &problem.id,
@@ -1144,8 +1374,19 @@ fn local_review(problem: &Problem, user_answer: &str) -> String {
     )
 }
 
+fn local_solution_guide(problem: &Problem) -> String {
+    format!(
+        "AI 未启用，无法生成个性化做题过程。\n\n本题可先这样做：\n1. 先圈出题干关键词。\n2. 对每个选项判断它是否直接回应题干。\n3. 排除明显偷换概念或方向相反的选项。\n4. 最后再选择你认为最贴合题干的选项。\n\n题型：{:?}\n\n注意：这里不会直接给出答案。",
+        problem.kind()
+    )
+}
+
 fn default_timeout_secs() -> u64 {
     30
+}
+
+fn default_knowledge_point_concurrency() -> usize {
+    4
 }
 
 fn log_ai_request_start(kind: &str, config: &AiConfig, body: &str, stream: bool) -> Instant {
@@ -1218,6 +1459,8 @@ mod tests {
             endpoint: "https://api.deepseek.com/chat/completions".into(),
             api_key: String::new(),
             model: "deepseek-chat".into(),
+            fast_model: String::new(),
+            knowledge_point_concurrency: super::default_knowledge_point_concurrency(),
             timeout_secs: 30,
         };
 
@@ -1249,6 +1492,118 @@ mod tests {
     }
 
     #[test]
+    fn solution_guide_prompt_forbids_leaking_answer() {
+        let problem = Problem {
+            id: "guide".into(),
+            prompt: "需求曲线通常如何变化？\nA. 向右下方\nB. 向右上方".into(),
+            answer: "A".into(),
+            explanation: String::new(),
+            tags: vec![],
+            problem_type: None,
+            deck_name: None,
+            deck_info: None,
+            images: vec![],
+        };
+
+        let prompt = super::build_solution_guide_prompt(&problem);
+        assert!(prompt.contains("绝对不要直接给出最终答案"));
+        assert!(prompt.contains("内部参考答案（禁止输出）：A"));
+    }
+
+    #[test]
+    fn knowledge_point_prompt_does_not_include_saved_answer() {
+        let problem = Problem {
+            id: "kp".into(),
+            prompt: "需求价格弹性是指什么？\nA. 需求量对价格变化的反应".into(),
+            answer: "A".into(),
+            explanation: String::new(),
+            tags: vec![],
+            problem_type: None,
+            deck_name: None,
+            deck_info: None,
+            images: vec![],
+        };
+
+        let prompt = super::build_knowledge_point_prompt(&problem);
+        assert!(prompt.contains("需求价格弹性"));
+        assert!(prompt.contains("不要输出选项字母或答案内容"));
+        assert!(!prompt.contains("选项/答案记录"));
+        assert!(!prompt.contains("答案：A"));
+    }
+
+    #[test]
+    fn streaming_chat_sends_authorization_header() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            thread,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let endpoint = format!(
+            "http://{}/chat/completions",
+            listener.local_addr().expect("local addr")
+        );
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut request_bytes = Vec::new();
+            let mut buffer = [0u8; 1024];
+            loop {
+                let size = stream.read(&mut buffer).expect("read request");
+                if size == 0 {
+                    break;
+                }
+                request_bytes.extend_from_slice(&buffer[..size]);
+                if request_bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request = String::from_utf8_lossy(&request_bytes).to_string();
+            assert!(request.contains("authorization: Bearer test-key") || request.contains("Authorization: Bearer test-key"));
+            let response = concat!(
+                "HTTP/1.1 200 OK\r\n",
+                "Content-Type: text/event-stream\r\n",
+                "Connection: close\r\n",
+                "\r\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+                "data: [DONE]\n\n"
+            );
+            stream.write_all(response.as_bytes()).expect("write response");
+        });
+
+        let config = AiConfig {
+            enabled: true,
+            endpoint,
+            api_key: "test-key".into(),
+            model: "test-model".into(),
+            fast_model: String::new(),
+            knowledge_point_concurrency: super::default_knowledge_point_concurrency(),
+            timeout_secs: 5,
+        };
+        let mut deltas = Vec::new();
+        let result = super::send_chat_messages_streaming(
+            &config,
+            vec![super::ChatCompletionMessage {
+                role: "user",
+                content: "hello".into(),
+            }],
+            |delta| deltas.push(delta),
+        )
+        .expect("streaming request should succeed");
+
+        handle.join().expect("server thread should finish");
+        assert_eq!(result, "ok");
+        assert_eq!(deltas, vec!["ok"]);
+    }
+
+    #[test]
+    fn knowledge_point_parser_limits_clean_tags() {
+        let points = super::parse_knowledge_points("需求弹性、供给曲线\n- 均衡价格, 这是一个非常非常非常非常非常长的标签");
+
+        assert_eq!(points, vec!["需求弹性", "供给曲线", "均衡价格"]);
+    }
+
+    #[test]
     fn local_problem_set_analysis_summarizes_types_and_tags() {
         let problem = Problem {
             id: "1".into(),
@@ -1269,7 +1624,7 @@ mod tests {
     }
 
     #[test]
-    fn problem_set_prompt_uses_tool_paging_instead_of_embedded_samples() {
+    fn problem_set_prompt_uses_summary_instead_of_embedded_samples() {
         let problems = (0..35)
             .map(|index| Problem {
                 id: format!("p{index}"),
@@ -1296,6 +1651,32 @@ mod tests {
         assert!(system_prompt.contains("每次只能请求一页题目"));
         assert!(system_prompt.contains("shuaforge.list_problems"));
         assert!(system_prompt.contains("shuaforge.get_problem"));
+    }
+
+    #[test]
+    fn compact_problem_set_prompt_uses_local_full_dataset_summary() {
+        let problems = (0..284)
+            .map(|index| Problem {
+                id: format!("p{index}"),
+                prompt: format!("经济学需求供给题目 {index}\nA. 是\nB. 否"),
+                answer: "A".into(),
+                explanation: String::new(),
+                tags: vec!["按得分推断".into(), "作答正确".into(), "本题得分:2.6分".into()],
+                problem_type: Some(crate::problem::ProblemType::SingleChoice),
+                deck_name: None,
+                deck_info: None,
+                images: vec![],
+            })
+            .collect::<Vec<_>>();
+
+        let prompt = super::build_compact_problem_set_analysis_prompt("经济学", &problems);
+        let system = super::compact_problem_set_analysis_system_prompt();
+
+        assert!(system.contains("程序已经在本地读取完全部题目"));
+        assert!(prompt.contains("已读取全部题目（284 / 284）"));
+        assert!(prompt.contains("压缩逐题摘要"));
+        assert!(!prompt.contains("shuaforge.list_problems"));
+        assert!(prompt.chars().count() < 30_000);
     }
 
     #[test]

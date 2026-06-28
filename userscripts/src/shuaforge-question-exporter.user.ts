@@ -85,6 +85,20 @@ interface ZipArchive {
     info: string;
   }
 
+  interface AnswerScore {
+    value: number;
+    display: string;
+  }
+
+  interface ParsedProblemDraft {
+    problem: Problem;
+    promptLine: string;
+    options: string[];
+    answer: string;
+    fullText: string;
+    answerScore: AnswerScore | null;
+  }
+
   interface VirtualQuestionBlock {
     nodeType: number;
     tagName: string;
@@ -105,11 +119,15 @@ interface ZipArchive {
   const IMAGE_PLACEHOLDER_PREFIX = '[图片]';
   const JSZIP_CDN = 'https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js';
   const PENDING_REVIEW_NOTE = '未批改：页面没有提供正确答案，已使用“我的答案”作为临时答案。';
+  const SCORE_INFERRED_NOTE = '页面没有提供标准答案，已使用“我的答案”作为导出答案；本题得分可用于判断该作答是否正确。';
   let selectedRoot: HTMLElement = document.body;
   let selecting = false;
   let lastProblems: Problem[] = [];
 
   const QUESTION_ROOT_SELECTORS = [
+    // 超星/学习通结果页：每道题是 questionLi，答案与得分在 mark_answer 内。
+    '.questionLi',
+    '.singleQuesId',
     // OCS 风格：各平台明确声明“每一道题”的 root，而不是扫描整个题型大节。
     '.q_main',
     '.question-item',
@@ -395,7 +413,8 @@ interface ZipArchive {
     const name = extractBankName(scope, text) || normalizeText(document.title).replace(/[-_].*$/, '').trim() || 'ShuaForge题库';
     const count = matchFirst(text, /题量\s*[:：]?\s*(\d+)/) || matchFirst(text, /共\s*(\d+)\s*题/);
     const score = matchFirst(text, /满分\s*[:：]?\s*(\d+)/);
-    const userScore = matchFirst(text, /(\d+)\s*分/);
+    const userScore = matchFirst(text, /智能分析\s*\n?\s*(\d+(?:\.\d+)?)\s*分/)
+      || matchFirst(text, /(^|\n)\s*(\d+(?:\.\d+)?)\s*分\s*(?:\n|$)/, 2);
     const time = matchFirst(text, /作答时间\s*[:：]?\s*([^\n]+)/);
     const info: string[] = [];
     if (count) info.push(`题量:${count}`);
@@ -450,27 +469,42 @@ interface ZipArchive {
     return score;
   }
 
-  function matchFirst(text: string, pattern: RegExp): string {
+  function matchFirst(text: string, pattern: RegExp, groupIndex = 1): string {
     const match = text.match(pattern);
-    return match && match[1] ? normalizeText(match[1]) : '';
+    return match && match[groupIndex] ? normalizeText(match[groupIndex]) : '';
   }
 
   function extractProblems(root: HTMLElement): Problem[] {
-    const blocks = findQuestionBlocks(root || document.body);
-    const problems: Problem[] = [];
+    const scope = root || document.body;
+    const blocks = findQuestionBlocks(scope);
+    const indexedScores = extractIndexedAnswerScores(scope);
+    const drafts: ParsedProblemDraft[] = [];
     const seen = new Set<string>();
 
     for (const block of blocks) {
-      const problem = parseProblemBlock(block, problems.length + 1);
-      if (!problem || !problem.prompt || !problem.answer) continue;
+      const draft = parseProblemBlock(block, drafts.length + 1, indexedScores.get(drafts.length + 1) || null);
+      if (!draft || !draft.problem.prompt || !draft.problem.answer) continue;
 
-      const key = `${problem.prompt}::${problem.answer}`;
+      const key = `${draft.problem.prompt}::${draft.problem.answer}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      problems.push(problem);
+      drafts.push(draft);
     }
 
-    return problems;
+    applySingleChoiceScoreFallback(drafts, extractBankInfo(scope));
+    return drafts.map((draft) => draft.problem);
+  }
+
+  function extractIndexedAnswerScores(root: HTMLElement): Map<number, AnswerScore> {
+    const scores = new Map<number, AnswerScore>();
+    const textBlocks = splitTextBlocksByQuestionNumber(root);
+    for (const block of textBlocks) {
+      const index = Number(block.dataset.virtualIndex || 0);
+      if (!index) continue;
+      const score = extractAnswerScore(getCleanLines(block));
+      if (score) scores.set(index, score);
+    }
+    return scores;
   }
 
   function findQuestionBlocks(root: HTMLElement): QuestionBlock[] {
@@ -568,6 +602,54 @@ interface ZipArchive {
     };
   }
 
+  function applySingleChoiceScoreFallback(drafts: ParsedProblemDraft[], bankInfo: BankInfo): void {
+    const missing = drafts.filter((draft) => !draft.answerScore && isTemporaryUserAnswer(draft.fullText, draft.answer));
+    if (missing.length === 0) return;
+    if (!drafts.every((draft) => inferTemporaryAnswerKind(draft.answer, draft.promptLine, draft.options) === 'single_choice')) return;
+
+    const totalScore = extractDeckInfoNumber(bankInfo.info, '得分');
+    const fullScore = extractDeckInfoNumber(bankInfo.info, '满分');
+    if (!totalScore || !fullScore) return;
+
+    const knownScore = drafts.reduce((total, draft) => total + (draft.answerScore?.value || 0), 0);
+    const knownWrongCount = drafts.filter((draft) => draft.answerScore && draft.answerScore.value <= 0).length;
+    const scorePerQuestion = fullScore / drafts.length;
+    if (!Number.isFinite(scorePerQuestion) || scorePerQuestion <= 0) return;
+
+    const inferredCorrectCount = Math.round((totalScore - knownScore) / scorePerQuestion);
+    const exactEvenScoreInference = inferredCorrectCount === missing.length;
+    const resultPageHidesCorrectScores = knownWrongCount > 0
+      && totalScore > knownScore
+      && totalScore < fullScore
+      && missing.length + knownWrongCount === drafts.length;
+    if (!exactEvenScoreInference && !resultPageHidesCorrectScores) return;
+
+    const inferredScore = formatScore(scorePerQuestion);
+    for (const draft of missing) {
+      const answerScore: AnswerScore = { value: scorePerQuestion, display: inferredScore };
+      draft.answerScore = answerScore;
+      draft.problem.explanation = exactEvenScoreInference
+        ? `${SCORE_INFERRED_NOTE} 当前页面未把本题得分放在题目块内，但整套题为单选题；按整卷得分 ${formatScore(totalScore)} / ${formatScore(fullScore)} 和已识别错题反推，该作答可视为正确。`
+        : `${SCORE_INFERRED_NOTE} 当前页面只在部分题目块显示 0 分错题，未显示本题题内得分；结合整卷得分 ${formatScore(totalScore)} / ${formatScore(fullScore)}、已识别 ${knownWrongCount} 道 0 分题，以及本套题均为单选题，可将该作答暂按正确处理。`;
+      draft.problem.tags = draft.problem.tags.filter((tag) => tag !== '未批改' && tag !== 'AI批改');
+      addScoreInferenceTags(draft.problem.tags, draft.fullText, draft.answer, answerScore, draft.promptLine, draft.options);
+      for (const tag of [exactEvenScoreInference ? '整卷得分反推' : '结果页显示规则反推', '作答正确']) {
+        if (!draft.problem.tags.includes(tag)) draft.problem.tags.push(tag);
+      }
+    }
+  }
+
+  function extractDeckInfoNumber(info: string, label: string): number {
+    const match = info.match(new RegExp(`${label}:([0-9]+(?:\\.[0-9]+)?)`));
+    if (!match?.[1]) return 0;
+    const value = Number(match[1]);
+    return Number.isFinite(value) ? value : 0;
+  }
+
+  function formatScore(value: number): string {
+    return value.toFixed(4).replace(/0+$/g, '').replace(/\.$/g, '');
+  }
+
   function chooseBestBlock(el: HTMLElement, root: HTMLElement): HTMLElement {
     let current = el;
     let best = el;
@@ -613,30 +695,32 @@ interface ZipArchive {
     return score;
   }
 
-  function parseProblemBlock(block: QuestionBlock, index: number): Problem | null {
+  function parseProblemBlock(block: QuestionBlock, index: number, fallbackScore: AnswerScore | null = null): ParsedProblemDraft | null {
     const rawLines = getCleanLines(block);
     if (rawLines.length === 0) return null;
 
     const fullText = rawLines.join('\n');
-    const answer = extractAnswer(fullText);
+    const answer = extractStructuredUserAnswer(block) || extractAnswer(fullText);
     if (!answer) return null;
 
-    const explanation = extractExplanation(rawLines, fullText, answer);
+    const promptLine = extractPromptLine(rawLines, block);
+    const options = extractOptions(rawLines);
+    const answerScore = extractStructuredAnswerScore(block) || extractAnswerScore(rawLines) || fallbackScore;
+    const explanation = extractExplanation(rawLines, fullText, answer, answerScore, promptLine, options);
     const tags = extractTags(rawLines, block);
-    if (isTemporaryUserAnswer(fullText, answer)) {
+    if (isTemporaryUserAnswer(fullText, answer) && !answerScore) {
       for (const tag of ['未批改', 'AI批改']) {
         if (!tags.includes(tag)) tags.push(tag);
       }
     }
-    const promptLine = extractPromptLine(rawLines, block);
-    const options = extractOptions(rawLines);
+    addScoreInferenceTags(tags, fullText, answer, answerScore, promptLine, options);
     const imageCandidates = textSnapshot(block).images;
     const imageLines = imageCandidates.map((image, imageIndex) => `${IMAGE_PLACEHOLDER_PREFIX}${imageIndex + 1}: ${image.src}`);
     const prompt = [promptLine, ...imageLines, ...options].filter(Boolean).join('\n');
 
     if (!prompt || prompt.length < 4) return null;
 
-    return {
+    const problem = {
       id: buildId(index, prompt),
       prompt,
       answer,
@@ -650,6 +734,8 @@ interface ZipArchive {
         source_url: image.src
       }))
     };
+
+    return { problem, promptLine, options, answer, fullText, answerScore };
   }
 
   function getCleanLines(block: QuestionBlock): string[] {
@@ -663,8 +749,8 @@ interface ZipArchive {
   }
 
   function isQuestionStartLine(line: string): boolean {
-    return /^(?:#{1,6}\s*)?\d+\s*[\.、]\s*(?:\([^)]*题\)|（[^）]*题）|\[[^\]]*题\]|【[^】]*题】)?\s*\S+/.test(line)
-      && !/^(\d+\s*[\.、]\s*)?(我的答案|你的答案|正确答案|参考答案|标准答案|答案解析|解析|知识点|得分)/.test(line);
+    return /^(?:#{1,6}\s*)?\d+\s*(?:、|[\.．](?!\d))\s*(?:\([^)]*题\)|（[^）]*题）|\[[^\]]*题\]|【[^】]*题】)?\s*\S+/.test(line)
+      && !/^(\d+\s*(?:、|[\.．](?!\d))\s*)?(我的答案|你的答案|正确答案|参考答案|标准答案|答案解析|解析|知识点|得分)/.test(line);
   }
 
   function countQuestionStarts(text: string): number {
@@ -673,12 +759,12 @@ interface ZipArchive {
 
   function getQuestionNumber(el: HTMLElement): number {
     const text = textSnapshot(el).text;
-    const match = text.match(/^(?:#{1,6}\s*)?(\d+)\s*[\.、]/m);
+    const match = text.match(/^(?:#{1,6}\s*)?(\d+)\s*(?:、|[\.．](?!\d))/m);
     return match ? Number(match[1]) : Number.MAX_SAFE_INTEGER;
   }
 
   function extractPromptLine(lines: string[], block: QuestionBlock): string {
-    const questionIndex = lines.findIndex((line: string) => /^(?:#{1,6}\s*)?\d+\s*[\.、]/.test(line));
+    const questionIndex = lines.findIndex((line: string) => /^(?:#{1,6}\s*)?\d+\s*(?:、|[\.．](?!\d))/.test(line));
     if (questionIndex >= 0) {
       const promptLines: string[] = [];
       for (let index = questionIndex; index < lines.length; index += 1) {
@@ -687,7 +773,7 @@ interface ZipArchive {
         const value = index === questionIndex
           ? line
             .replace(/^#{1,6}\s*/, '')
-            .replace(/^\d+\s*[\.、]\s*/, '')
+            .replace(/^\d+\s*(?:、|[\.．](?!\d))\s*/, '')
             .replace(/^\([^)]*题\)\s*/, '')
             .replace(/^（[^）]*题）\s*/, '')
             .trim()
@@ -745,7 +831,7 @@ interface ZipArchive {
   function cleanPromptText(value: unknown): string {
     return normalizeText(value)
       .replace(/^#{1,6}\s*/, '')
-      .replace(/^\d+\s*[\.、]\s*/, '')
+      .replace(/^\d+\s*(?:、|[\.．](?!\d))\s*/, '')
       .replace(/^\([^)]*题\)\s*/, '')
       .replace(/^（[^）]*题）\s*/, '')
       .replace(/^题目\s*[:：]?\s*/, '')
@@ -842,12 +928,95 @@ interface ZipArchive {
     return choices.join(',');
   }
 
-  function extractExplanation(lines: string[], fullText: string, answer: string): string {
+  function extractStructuredUserAnswer(block: QuestionBlock): string {
+    if (!isRealElement(block)) return '';
+    const candidates = [
+      '.stuAnswerContent',
+      '[class*="stuAnswer" i]',
+      '[class*="myAnswer" i]',
+      '[class*="userAnswer" i]'
+    ];
+
+    for (const selector of candidates) {
+      try {
+        const el = block.querySelector<HTMLElement>(selector);
+        const text = el ? normalizeText(el.innerText || el.textContent || '') : '';
+        const answer = cleanExtractedAnswer(text);
+        if (answer) return answer;
+      } catch {
+        // 忽略不兼容选择器。
+      }
+    }
+    return '';
+  }
+
+  function extractStructuredAnswerScore(block: QuestionBlock): AnswerScore | null {
+    if (!isRealElement(block)) return null;
+    const candidates = [
+      '.mark_score .totalScore i.custom-style',
+      '.mark_score .totalScore i',
+      '.mark_score .totalScore',
+      '.mark_score [class*="totalScore" i] i',
+      '.mark_score [class*="totalScore" i]',
+      '.totalScore',
+      '[class*="score" i]'
+    ];
+
+    for (const selector of candidates) {
+      try {
+        for (const el of Array.from(block.querySelectorAll<HTMLElement>(selector))) {
+          const text = normalizeText(el.innerText || el.textContent || '');
+          const score = parseScoreText(text) || parseBareScoreText(text);
+          if (score) return score;
+        }
+      } catch {
+        // 忽略不兼容选择器。
+      }
+    }
+    return null;
+  }
+
+  function parseBareScoreText(text: string): AnswerScore | null {
+    const match = normalizeText(text).match(/^\d+(?:\.\d+)?$/);
+    if (!match) return null;
+    const value = Number(match[0]);
+    if (!Number.isFinite(value)) return null;
+    return { value, display: match[0] };
+  }
+
+  function extractAnswerScore(lines: string[]): AnswerScore | null {
+    for (const line of lines) {
+      if (/题量|满分|作答时间|智能分析/.test(line)) continue;
+      const score = parseScoreText(line);
+      if (score) return score;
+    }
+    return null;
+  }
+
+  function parseScoreText(text: string): AnswerScore | null {
+    const match = normalizeText(text).match(/(?:^|[;；\s])\*?\s*(\d+(?:\.\d+)?)\s*\*?\s*分\s*$/);
+    if (!match?.[1]) return null;
+    const value = Number(match[1]);
+    if (!Number.isFinite(value)) return null;
+    return { value, display: match[1] };
+  }
+
+  function extractExplanation(
+    lines: string[],
+    fullText: string,
+    answer: string,
+    answerScore: AnswerScore | null,
+    promptLine: string,
+    options: string[]
+  ): string {
     const inline = fullText.match(/(?:答案解析|解析)\s*[:：]\s*([\s\S]*?)(?:\n\s*(?:知识点|考点|标签|得分)\s*[:：]?|$)/);
     if (inline && inline[1]) return normalizeText(inline[1]);
 
     const index = lines.findIndex((line: string) => /^(答案解析|解析)[:：]?/.test(line));
     if (index < 0) {
+      if (isTemporaryUserAnswer(fullText, answer) && answerScore) {
+        return buildScoreInferredExplanation(answerScore, answer, promptLine, options);
+      }
       return isTemporaryUserAnswer(fullText, answer) ? PENDING_REVIEW_NOTE : '';
     }
 
@@ -858,6 +1027,68 @@ interface ZipArchive {
       if (line) chunks.push(line);
     }
     return chunks.join(' ');
+  }
+
+  function buildScoreInferredExplanation(answerScore: AnswerScore, answer: string, promptLine: string, options: string[]): string {
+    const kind = inferTemporaryAnswerKind(answer, promptLine, options);
+    if (kind === 'single_choice') {
+      return answerScore.value > 0
+        ? `${SCORE_INFERRED_NOTE} 当前作答得分 ${answerScore.display} 分，单选题可推断该答案正确。`
+        : `${SCORE_INFERRED_NOTE} 当前作答得分 0 分，单选题可推断该作答错误；因页面未给出标准答案，需人工补全正确答案。`;
+    }
+    if (kind === 'multiple_choice') {
+      return `${SCORE_INFERRED_NOTE} 当前作答得分 ${answerScore.display} 分；多选题可能存在少选/多选/部分得分规则，需人工复核后再作为标准答案使用。`;
+    }
+    return `${SCORE_INFERRED_NOTE} 当前作答得分 ${answerScore.display} 分；填空/主观题评分规则不确定，需人工复核后再作为标准答案使用。`;
+  }
+
+  function addScoreInferenceTags(
+    tags: string[],
+    fullText: string,
+    answer: string,
+    answerScore: AnswerScore | null,
+    promptLine: string,
+    options: string[]
+  ): void {
+    if (!answerScore || !isTemporaryUserAnswer(fullText, answer)) return;
+
+    const kind = inferTemporaryAnswerKind(answer, promptLine, options);
+    const inferredTags = ['无标准答案', '按得分推断', `本题得分:${answerScore.display}分`];
+
+    if (kind === 'single_choice') {
+      inferredTags.push(answerScore.value > 0 ? '作答正确' : '作答错误');
+      if (answerScore.value <= 0) inferredTags.push('待复核');
+    } else if (kind === 'multiple_choice') {
+      inferredTags.push('多选需复核');
+      if (answerScore.value <= 0) inferredTags.push('作答错误');
+    } else {
+      inferredTags.push('填空需复核');
+      if (answerScore.value <= 0) inferredTags.push('作答错误');
+    }
+
+    for (const tag of inferredTags) {
+      if (!tags.includes(tag)) tags.push(tag);
+    }
+  }
+
+  function inferTemporaryAnswerKind(answer: string, promptLine: string, options: string[]): 'single_choice' | 'multiple_choice' | 'text' {
+    if (options.length < 2) return 'text';
+    const normalizedChoice = normalizeChoiceLikeAnswer(answer);
+    if (!normalizedChoice) return 'text';
+    const prompt = normalizeText(promptLine);
+    if (normalizedChoice.length > 1 || /多选题|多项选择|不定项|哪些|正确的有|包括|属于.+有|因素有|方法有/.test(prompt)) {
+      return 'multiple_choice';
+    }
+    return 'single_choice';
+  }
+
+  function normalizeChoiceLikeAnswer(value: string): string {
+    const choices = normalizeAnswer(value)
+      .split(/[,，、;；#\s]+/)
+      .flatMap((part) => part.split(''))
+      .filter((ch) => /^[A-H]$/i.test(ch))
+      .map((ch) => ch.toUpperCase());
+    return Array.from(new Set(choices)).join('');
   }
 
   function isTemporaryUserAnswer(text: string, answer: string): boolean {
