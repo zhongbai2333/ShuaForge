@@ -1,0 +1,144 @@
+name: Android Build
+
+on:
+    workflow_call:
+        inputs:
+            ref:
+                description: "Git ref to checkout before building. Defaults to the caller ref."
+                required: false
+                type: string
+            version:
+                description: "Version suffix used in uploaded Android artifacts."
+                required: true
+                type: string
+            artifact-prefix:
+                description: "Prefix for uploaded GitHub Actions artifact names."
+                required: false
+                type: string
+                default: android-build
+            abis:
+                description: "Comma-separated Android ABIs to build, for example arm64-v8a,x86_64."
+                required: false
+                type: string
+                default: arm64-v8a,x86_64
+        secrets:
+            ANDROID_KEYSTORE_BASE64:
+                required: false
+            ANDROID_KEY_ALIAS:
+                required: false
+            ANDROID_KEY_PASSWORD:
+                required: false
+            ANDROID_STORE_PASSWORD:
+                required: false
+    workflow_dispatch:
+        inputs:
+            version:
+                description: "Version suffix used in uploaded Android artifacts."
+                required: false
+                type: string
+                default: manual
+            artifact-prefix:
+                description: "Prefix for uploaded GitHub Actions artifact names."
+                required: false
+                type: string
+                default: android-build
+            abis:
+                description: "Comma-separated Android ABIs to build."
+                required: false
+                type: string
+                default: arm64-v8a,x86_64
+
+permissions:
+    contents: read
+
+jobs:
+    build-apk:
+        name: Build Android release APK
+        runs-on: ubuntu-latest
+        env:
+            ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+              with:
+                  ref: ${{ inputs.ref || github.ref }}
+
+            - name: Set up JDK 21
+              uses: actions/setup-java@v4
+              with:
+                  distribution: temurin
+                  java-version: 21
+
+            - name: Install Rust Android targets
+              uses: dtolnay/rust-toolchain@stable
+              with:
+                  targets: "aarch64-linux-android,x86_64-linux-android"
+
+            - name: Install Node.js
+              uses: actions/setup-node@v4
+              with:
+                  node-version: 22
+                  cache: npm
+
+            - name: Set up Android SDK
+              uses: android-actions/setup-android@v3
+
+            - name: Install Android SDK packages
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  yes | sdkmanager --licenses >/dev/null || true
+                  sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;30.0.14904198"
+                  echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/30.0.14904198" >> "$GITHUB_ENV"
+
+            - name: Cache Gradle and cargo artifacts
+              uses: actions/cache@v4
+              with:
+                  path: |
+                      ~/.gradle/caches
+                      ~/.gradle/wrapper
+                      ~/.cargo/registry
+                      ~/.cargo/git
+                      target
+                  key: ${{ runner.os }}-android-${{ hashFiles('Cargo.lock', 'android/**/*.gradle', 'android/gradle/wrapper/gradle-wrapper.properties') }}
+                  restore-keys: |
+                      ${{ runner.os }}-android-
+                      ${{ runner.os }}-cargo-
+
+            - name: Build embedded userscript
+              run: |
+                  npm ci
+                  npm run build:userscript
+
+            - name: Decode signing keystore
+              if: env.ANDROID_KEYSTORE_BASE64 != ''
+              shell: bash
+              run: echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > android/app/release.keystore
+
+            - name: Build release APK
+              working-directory: android
+              env:
+                  ANDROID_KEYSTORE_FILE: ${{ env.ANDROID_KEYSTORE_BASE64 != '' && 'release.keystore' || '' }}
+                  ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+                  ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+                  ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+              run: |
+                  chmod +x gradlew
+                  ./gradlew cargoBuildRelease assembleRelease -PshuaforgeAbis=${{ inputs.abis || 'arm64-v8a,x86_64' }} --stacktrace --no-daemon
+
+            - name: Package Android artifacts
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  version='${{ inputs.version || github.run_number }}'
+                  mkdir -p android-assets
+                  cp android/app/build/outputs/apk/release/app-release.apk "android-assets/ShuaForge-Android-release-${version}.apk"
+                  sha256sum android-assets/* > android-assets/SHA256SUMS.txt
+                  ls -la android-assets
+
+            - name: Upload Android artifact
+              uses: actions/upload-artifact@v4
+              with:
+                  name: ${{ inputs.artifact-prefix }}-apk
+                  path: android-assets/*
+                  if-no-files-found: error

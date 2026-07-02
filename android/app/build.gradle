@@ -1,0 +1,156 @@
+plugins {
+    id 'com.android.application'
+}
+
+def selectedAbiNames = (findProperty('shuaforgeAbis') ?: 'x86_64')
+    .toString()
+    .split(',')
+    .collect { it.trim() }
+    .findAll { !it.isEmpty() }
+
+android {
+    namespace 'com.zhongbai.shuaforge'
+    compileSdk 35
+    ndkVersion '30.0.14904198'
+
+    defaultConfig {
+        applicationId 'com.zhongbai.shuaforge'
+        minSdk 26
+        targetSdk 35
+        versionCode 1
+        versionName '0.1.5'
+
+        ndk {
+            abiFilters(*selectedAbiNames)
+        }
+    }
+
+    sourceSets {
+        main {
+            jniLibs.srcDirs = ["$buildDir/rustJniLibs"]
+        }
+    }
+
+    signingConfigs {
+        def keystoreFile = System.getenv('ANDROID_KEYSTORE_FILE') ?: findProperty('ANDROID_KEYSTORE_FILE')
+        def keyAliasValue = System.getenv('ANDROID_KEY_ALIAS') ?: findProperty('ANDROID_KEY_ALIAS')
+        def storePasswordValue = System.getenv('ANDROID_STORE_PASSWORD') ?: findProperty('ANDROID_STORE_PASSWORD')
+        def keyPasswordValue = System.getenv('ANDROID_KEY_PASSWORD') ?: findProperty('ANDROID_KEY_PASSWORD')
+
+        if (keystoreFile && keyAliasValue) {
+            release {
+                storeFile file(keystoreFile)
+                keyAlias keyAliasValue
+                storePassword storePasswordValue
+                keyPassword keyPasswordValue
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            signingConfig signingConfigs.findByName('release') ?: signingConfigs.debug
+        }
+    }
+}
+
+def repoRoot = file('../..')
+def cargoManifest = new File(repoRoot, 'Cargo.toml')
+def rustOutDir = new File(repoRoot, 'target')
+def androidApi = 35
+def rustLibraryName = 'shuaforge_core'
+
+def rustTargets = [
+    'arm64-v8a': [triple: 'aarch64-linux-android', envPrefix: 'AARCH64_LINUX_ANDROID', clangPrefix: 'aarch64-linux-android', soDir: 'arm64-v8a'],
+    'x86_64'   : [triple: 'x86_64-linux-android',  envPrefix: 'X86_64_LINUX_ANDROID',  clangPrefix: 'x86_64-linux-android',  soDir: 'x86_64'],
+]
+
+def hostPrebuiltDir(File ndkDir) {
+    def prebuilt = new File(ndkDir, 'toolchains/llvm/prebuilt')
+    def names = org.gradle.internal.os.OperatingSystem.current().isWindows()
+        ? ['windows-x86_64']
+        : (org.gradle.internal.os.OperatingSystem.current().isMacOsX()
+            ? ['darwin-x86_64', 'darwin-aarch64']
+            : ['linux-x86_64'])
+    def found = names.collect { new File(prebuilt, it) }.find { it.isDirectory() }
+    if (found == null) {
+        throw new RuntimeException("Cannot find Android NDK LLVM prebuilt directory under ${prebuilt}")
+    }
+    return found
+}
+
+def toolPath(File llvmBin, String executableName) {
+    def windowsName = executableName.endsWith('.exe') || executableName.endsWith('.cmd')
+        ? executableName
+        : "${executableName}.cmd"
+    def candidate = org.gradle.internal.os.OperatingSystem.current().isWindows()
+        ? new File(llvmBin, windowsName)
+        : new File(llvmBin, executableName)
+    if (!candidate.exists() && org.gradle.internal.os.OperatingSystem.current().isWindows()) {
+        candidate = new File(llvmBin, executableName)
+    }
+    return candidate.absolutePath
+}
+
+def registerCargoBuildTask = { taskName, cargoProfile, profileDir ->
+    tasks.register(taskName) {
+        group = 'build'
+        description = "Build Rust cdylib for Android ${cargoProfile} ABIs and copy it into generated jniLibs."
+
+        inputs.file(cargoManifest)
+        inputs.dir(new File(repoRoot, 'src'))
+        inputs.dir(new File(repoRoot, 'assets'))
+        outputs.dir("$buildDir/rustJniLibs")
+
+        doLast {
+            def ndkHome = System.getenv('ANDROID_NDK_HOME')
+            def ndkDir = ndkHome ? file(ndkHome) : android.ndkDirectory
+            if (ndkDir == null || !ndkDir.isDirectory()) {
+                throw new RuntimeException('Android NDK not found. Install NDK in Android Studio or set ANDROID_NDK_HOME.')
+            }
+            def llvmBin = new File(hostPrebuiltDir(ndkDir), 'bin')
+            rustTargets.findAll { abi, cfg -> selectedAbiNames.contains(abi) }.each { abi, cfg ->
+                def clang = toolPath(llvmBin, "${cfg.clangPrefix}${androidApi}-clang")
+                def ar = toolPath(llvmBin, 'llvm-ar')
+                def cargoCommand = ['cargo', 'build', '--lib', '--target', cfg.triple.toString()]
+                if (cargoProfile == 'release') {
+                    cargoCommand.add('--release')
+                }
+                def processBuilder = new ProcessBuilder(cargoCommand)
+                processBuilder.directory(repoRoot)
+                processBuilder.inheritIO()
+                processBuilder.environment().put("CC_${cfg.triple.replace('-', '_')}".toString(), clang.toString())
+                processBuilder.environment().put("AR_${cfg.triple.replace('-', '_')}".toString(), ar.toString())
+                processBuilder.environment().put("CARGO_TARGET_${cfg.envPrefix}_LINKER".toString(), clang.toString())
+                def process = processBuilder.start()
+                def exitCode = process.waitFor()
+                if (exitCode != 0) {
+                    throw new RuntimeException("Cargo build failed for ${cfg.triple} with exit code ${exitCode}")
+                }
+
+                def sourceSo = new File(rustOutDir, "${cfg.triple}/${profileDir}/lib${rustLibraryName}.so")
+                if (!sourceSo.exists()) {
+                    throw new RuntimeException("Rust shared library not found: ${sourceSo}")
+                }
+                def destDir = new File(buildDir, "rustJniLibs/${cfg.soDir}")
+                destDir.mkdirs()
+                java.nio.file.Files.copy(
+                    sourceSo.toPath(),
+                    new File(destDir, "lib${rustLibraryName}.so").toPath(),
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING
+                )
+            }
+        }
+    }
+}
+
+registerCargoBuildTask('cargoBuildDebug', 'debug', 'debug')
+registerCargoBuildTask('cargoBuildRelease', 'release', 'release')
+
+tasks.matching { it.name.startsWith('merge') && it.name.endsWith('JniLibFolders') }.configureEach {
+    if (it.name.toLowerCase().contains('release')) {
+        dependsOn tasks.named('cargoBuildRelease')
+    } else {
+        dependsOn tasks.named('cargoBuildDebug')
+    }
+}

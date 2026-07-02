@@ -8,7 +8,9 @@ on:
             - "userscripts/**"
             - "Cargo.toml"
             - "Cargo.lock"
+            - "android/**"
             - ".github/workflows/ci.yml"
+            - ".github/workflows/android-build.yml"
             - ".github/workflows/desktop-build.yml"
             - ".github/workflows/pr-review.yml"
             - ".github/workflows/release.yml"
@@ -19,7 +21,9 @@ on:
             - "userscripts/**"
             - "Cargo.toml"
             - "Cargo.lock"
+            - "android/**"
             - ".github/workflows/ci.yml"
+            - ".github/workflows/android-build.yml"
             - ".github/workflows/desktop-build.yml"
             - ".github/workflows/pr-review.yml"
             - ".github/workflows/release.yml"
@@ -79,3 +83,11 @@ jobs:
         with:
             version: ci-${{ github.sha }}
             artifact-prefix: ci-desktop
+
+    build-android:
+        name: Build Android APK
+        uses: ./.github/workflows/android-build.yml
+        secrets: inherit
+        with:
+            version: ci-${{ github.sha }}
+            artifact-prefix: ci-android

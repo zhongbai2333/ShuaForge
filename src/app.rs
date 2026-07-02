@@ -2,21 +2,62 @@ use crate::{
     ai::{
         AiConfig, AnalysisStreamEvent, AnalysisToolResult,
         annotate_problem_knowledge_points_with_progress, call_learning_gap_analysis_tool,
-        continue_analysis_chat, explain_wrong_answer, guide_solution_process, load_ai_config,
-        review_pending_problems_with_progress, save_ai_config, stream_problem_set_analysis_tool,
+        continue_analysis_chat, explain_wrong_answer, guide_solution_process,
+        pre_generate_explanations_with_progress, review_pending_problems_with_progress,
+        stream_problem_set_analysis_tool,
     },
-    ai_import::{AiImportResult, import_problem_bank_with_ai},
+    ai_import::AiImportResult,
     deck::{PracticeDeck, PracticeDeckSnapshot, PracticeOrder, SubmitResult},
-    logging,
-    problem::{Problem, ProblemType, load_problems, normalize_choice_answer},
+    lan_sync::{self, SyncImportSummary},
+    problem::{
+        Problem, ProblemAnswerSource, ProblemType, load_problems, load_problems_from_json_text,
+        load_problems_from_text, normalize_choice_answer, visible_tags,
+    },
+    problem_export::{
+        ExportProblemBank, default_export_file_name, export_problem_bank_json,
+        export_problem_bank_zip,
+    },
     self_update::{self, UpdateInfo, UpdateOutcome},
     store::{AnswerRecord, AppStore, DeckCard, GroupCard},
-    userscript_server,
 };
-use eframe::egui::{self, FontData, FontDefinitions, FontFamily};
+#[cfg(not(target_os = "android"))]
+use crate::{
+    ai::{load_ai_config, save_ai_config},
+    ai_import::import_problem_bank_with_ai,
+    logging, userscript_server,
+};
+mod analysis_ui;
+mod fonts;
+mod layout;
+mod library_cards;
+mod markdown;
+mod navigation;
+mod practice_input;
+mod preview;
+mod settings_ui;
+mod widgets;
+use analysis_ui::{render_analysis_input_bar, render_analysis_progress_bar, render_chat_message};
+use eframe::egui;
+use fonts::configure_fonts;
+use library_cards::{
+    CARD_WIDTH, render_group_card, render_library_deck_card, render_mobile_group_card,
+    render_mobile_library_deck_card, render_problem, render_trash_zone,
+};
+use markdown::{FormulaRenderSettings, apply_formula_render_settings, render_markdown_text};
+use practice_input::{
+    clear_egui_keyboard_focus, handle_practice_keyboard, render_answer_input,
+    suppress_practice_tab_focus,
+};
+use preview::{ProblemPreviewAction, render_problem_preview_row};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
-use std::{path::PathBuf, sync::mpsc, thread};
+use std::{
+    path::{Path, PathBuf},
+    sync::mpsc,
+    thread,
+};
+use widgets::{add_content_safe_area, format_bytes, grid_columns, render_update_progress_bar};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AppTheme {
@@ -31,12 +72,31 @@ impl AppTheme {
             AppTheme::Light => egui::Visuals::light(),
         }
     }
+
+    fn apply_to_context(self, ctx: &egui::Context) {
+        let mut visuals = self.visuals();
+        visuals.override_text_color = None;
+        ctx.set_visuals(visuals);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AppView {
     Library,
     Practice,
+    Settings,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppUiMode {
+    Desktop,
+    Mobile,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LibraryDeckViewMode {
+    Cards,
+    List,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -67,6 +127,103 @@ struct AnalysisDialogState {
     latest_result: String,
     is_loading: bool,
     open: bool,
+}
+
+#[derive(Debug, Clone)]
+struct DeckPreviewState {
+    deck_id: i64,
+    deck_name: String,
+    problems: Vec<Problem>,
+    open: bool,
+    editing_problem_id: Option<String>,
+    editing_answer: String,
+}
+
+#[derive(Debug, Default, Clone)]
+struct ImportQualitySummary {
+    total: usize,
+    standard: usize,
+    user_temporary: usize,
+    score_inferred: usize,
+    ai_reviewed: usize,
+    manual_reviewed: usize,
+    review_needed: usize,
+    single_choice: usize,
+    multiple_choice: usize,
+    text: usize,
+}
+
+#[derive(Debug, Default)]
+struct ProblemImportBatchSummary {
+    imported_files: usize,
+    imported: usize,
+    inserted: usize,
+    updated: usize,
+    failures: Vec<String>,
+    last_imported_path: Option<PathBuf>,
+    quality: ImportQualitySummary,
+}
+
+impl ImportQualitySummary {
+    fn from_problems(problems: &[Problem]) -> Self {
+        let mut summary = Self::default();
+        for problem in problems {
+            summary.total += 1;
+            match problem.state.answer_source {
+                ProblemAnswerSource::Standard => summary.standard += 1,
+                ProblemAnswerSource::UserTemporary => summary.user_temporary += 1,
+                ProblemAnswerSource::ScoreInferred => summary.score_inferred += 1,
+                ProblemAnswerSource::AiReviewed => summary.ai_reviewed += 1,
+                ProblemAnswerSource::ManualReviewed => summary.manual_reviewed += 1,
+            }
+            if problem.needs_ai_review() {
+                summary.review_needed += 1;
+            }
+            match problem.kind() {
+                ProblemType::SingleChoice => summary.single_choice += 1,
+                ProblemType::MultipleChoice => summary.multiple_choice += 1,
+                ProblemType::Text => summary.text += 1,
+            }
+        }
+        summary
+    }
+
+    fn add(&mut self, other: &Self) {
+        self.total += other.total;
+        self.standard += other.standard;
+        self.user_temporary += other.user_temporary;
+        self.score_inferred += other.score_inferred;
+        self.ai_reviewed += other.ai_reviewed;
+        self.manual_reviewed += other.manual_reviewed;
+        self.review_needed += other.review_needed;
+        self.single_choice += other.single_choice;
+        self.multiple_choice += other.multiple_choice;
+        self.text += other.text;
+    }
+
+    fn describe(&self) -> String {
+        if self.total == 0 {
+            return String::new();
+        }
+        let mut parts = vec![format!(
+            "题型：单选 {}，多选 {}，文本 {}",
+            self.single_choice, self.multiple_choice, self.text
+        )];
+        parts.push(format!(
+            "答案来源：标准 {}，临时 {}，得分推断 {}，AI复核 {}，人工确认 {}",
+            self.standard,
+            self.user_temporary,
+            self.score_inferred,
+            self.ai_reviewed,
+            self.manual_reviewed
+        ));
+        if self.review_needed > 0 {
+            parts.push(format!("需 AI/人工复核 {}", self.review_needed));
+        } else {
+            parts.push("无需复核".into());
+        }
+        parts.join("；")
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,6 +290,22 @@ struct AiImportAsyncResponse {
     result: Result<AiImportResult, String>,
 }
 
+#[derive(Debug, Clone)]
+struct BrowserSnapshotImportMeta {
+    source_path: PathBuf,
+    director_title: String,
+}
+
+struct BrowserSnapshotImport {
+    path: PathBuf,
+    director_title: String,
+    problems: Vec<Problem>,
+    quality: ImportQualitySummary,
+    imported: usize,
+    inserted: usize,
+    updated: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AnalysisProgressState {
     label: String,
@@ -180,6 +353,7 @@ enum UpdateAsyncResponse {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UpdateCheckSource {
+    #[cfg(not(target_os = "android"))]
     Startup,
     Manual,
 }
@@ -197,7 +371,9 @@ impl AnalysisDialogState {
         arguments_json: String,
     ) -> Self {
         let kind_label = match kind {
-            AnalysisKind::ProblemSet => "请分析这组题目的题型、难度和知识点。",
+            AnalysisKind::ProblemSet => {
+                "请作为 AI 总监审查这组题目的采集质量、待复核项和学习价值。"
+            }
             AnalysisKind::LearningGap => "请根据答题记录分析需要提升的内容。",
         };
         Self {
@@ -217,7 +393,7 @@ impl AnalysisDialogState {
                 ChatMessage {
                     role: ChatRole::Assistant,
                     title: "助手".into(),
-                    content: "正在分析，请稍候...".into(),
+                    content: "AI 总监正在审查，请稍候...".into(),
                 },
             ],
             input: String::new(),
@@ -236,6 +412,10 @@ struct PersistedSettings {
     practice_order: PersistedPracticeOrder,
     #[serde(default)]
     ai_config: AiConfig,
+    #[serde(default)]
+    formula_render: FormulaRenderSettings,
+    #[serde(default)]
+    library_deck_view: PersistedLibraryDeckViewMode,
 }
 
 impl Default for PersistedSettings {
@@ -244,8 +424,18 @@ impl Default for PersistedSettings {
             theme: PersistedTheme::Dark,
             practice_order: PersistedPracticeOrder::Shuffled,
             ai_config: AiConfig::default(),
+            formula_render: FormulaRenderSettings::default(),
+            library_deck_view: PersistedLibraryDeckViewMode::Cards,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+enum PersistedLibraryDeckViewMode {
+    #[default]
+    Cards,
+    List,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
@@ -300,16 +490,45 @@ impl From<PersistedPracticeOrder> for PracticeOrder {
     }
 }
 
+impl From<LibraryDeckViewMode> for PersistedLibraryDeckViewMode {
+    fn from(value: LibraryDeckViewMode) -> Self {
+        match value {
+            LibraryDeckViewMode::Cards => PersistedLibraryDeckViewMode::Cards,
+            LibraryDeckViewMode::List => PersistedLibraryDeckViewMode::List,
+        }
+    }
+}
+
+impl From<PersistedLibraryDeckViewMode> for LibraryDeckViewMode {
+    fn from(value: PersistedLibraryDeckViewMode) -> Self {
+        match value {
+            PersistedLibraryDeckViewMode::Cards => LibraryDeckViewMode::Cards,
+            PersistedLibraryDeckViewMode::List => LibraryDeckViewMode::List,
+        }
+    }
+}
+
 const SETTINGS_KEY: &str = "app_settings";
 const UPDATE_SETTINGS_KEY: &str = "update_settings";
 const ANALYSIS_CACHE_KEY: &str = "analysis_dialog_cache";
 const ANALYSIS_TEXT_CACHE_KEY: &str = "analysis_text_cache";
 const PRACTICE_SESSION_KEY: &str = "practice_session:latest";
 
-const CARD_WIDTH: f32 = 300.0;
-const GROUP_CARD_HEIGHT: f32 = 158.0;
-const DECK_CARD_HEIGHT: f32 = 188.0;
-const CARD_BUTTON_WIDTH: f32 = 76.0;
+const MOBILE_SIDE_SAFE: f32 = 16.0;
+const MOBILE_TOP_SAFE: f32 = 36.0;
+const MOBILE_BOTTOM_SAFE: f32 = 20.0;
+const MOBILE_TOUCH_HEIGHT: f32 = 44.0;
+const MOBILE_CONTENT_PAD: f32 = 12.0;
+const DESKTOP_CONTENT_PAD: f32 = 20.0;
+const DESKTOP_TOP_BAR_PAD_X: f32 = 14.0;
+const DESKTOP_TOP_BAR_PAD_Y: f32 = 8.0;
+const DESKTOP_BUTTON_HEIGHT: f32 = 32.0;
+const DESKTOP_QUESTION_RATIO: f32 = 0.54;
+const DESKTOP_ANALYSIS_MIN_WIDTH: f32 = 260.0;
+const MOBILE_LIBRARY_CARD_TARGET_WIDTH: f32 = 220.0;
+const MOBILE_LIBRARY_CARD_MIN_WIDTH: f32 = 120.0;
+const MOBILE_LIBRARY_CARD_GAP: f32 = 8.0;
+const DESKTOP_GAP: f32 = 20.0;
 
 struct ThirdPartyLicense {
     name: &'static str,
@@ -352,6 +571,11 @@ const THIRD_PARTY_LICENSES: &[ThirdPartyLicense] = &[
         name: "rand",
         license: "MIT OR Apache-2.0",
         url: "https://github.com/rust-random/rand",
+    },
+    ThirdPartyLicense {
+        name: "resvg",
+        license: "MIT OR Apache-2.0",
+        url: "https://github.com/linebender/resvg",
     },
     ThirdPartyLicense {
         name: "rfd",
@@ -406,6 +630,7 @@ const THIRD_PARTY_LICENSES: &[ThirdPartyLicense] = &[
 ];
 
 pub struct ShuaForgeApp {
+    ui_mode: AppUiMode,
     deck: Option<PracticeDeck>,
     view: AppView,
     store: Option<AppStore>,
@@ -413,6 +638,9 @@ pub struct ShuaForgeApp {
     answer_input: String,
     selected_single: Option<String>,
     selected_multiple: BTreeSet<String>,
+    focused_choice_index: usize,
+    keyboard_choice_focus_visible: bool,
+    clear_practice_focus_next_frame: bool,
     status: String,
     analysis: String,
     loaded_path: Option<PathBuf>,
@@ -421,7 +649,11 @@ pub struct ShuaForgeApp {
     analysis_receiver: Option<mpsc::Receiver<AnalysisAsyncResponse>>,
     analysis_stream_receiver: Option<mpsc::Receiver<AnalysisStreamResponse>>,
     chat_receiver: Option<mpsc::Receiver<ChatAsyncResponse>>,
-    ai_import_receiver: Option<mpsc::Receiver<AiImportAsyncResponse>>,
+    ai_import_receiver: Option<mpsc::Receiver<Vec<AiImportAsyncResponse>>>,
+    browser_snapshot_receiver: Option<mpsc::Receiver<String>>,
+    sync_receiver: Option<mpsc::Receiver<Result<SyncImportSummary, String>>>,
+    sync_server_addr: Option<String>,
+    sync_status: String,
     update_receiver: Option<mpsc::Receiver<UpdateAsyncResponse>>,
     update_info: Option<UpdateInfo>,
     update_status: String,
@@ -435,21 +667,27 @@ pub struct ShuaForgeApp {
     analysis_generation_id: u64,
     analysis_progress: Option<AnalysisProgressState>,
     analysis_dialog: Option<AnalysisDialogState>,
+    deck_preview: Option<DeckPreviewState>,
     analysis_dialogs: HashMap<AnalysisCacheKey, AnalysisDialogState>,
     active_analysis_key: Option<AnalysisCacheKey>,
     analysis_cache: HashMap<AnalysisCacheKey, AnalysisDialogState>,
     analysis_sources: HashMap<AnalysisCacheKey, AnalysisSource>,
     is_ai_loading: bool,
     is_ai_importing: bool,
+    formula_render_settings: FormulaRenderSettings,
     theme: AppTheme,
     practice_order: PracticeOrder,
+    library_deck_view: LibraryDeckViewMode,
     deck_cards: Vec<DeckCard>,
     group_cards: Vec<GroupCard>,
     active_deck_name: Option<String>,
     answer_history: Vec<AnswerRecord>,
     bank_count: usize,
     show_about: bool,
+    show_text_import_dialog: bool,
+    text_import_buffer: String,
     new_group_name: String,
+    selected_deck_ids: BTreeSet<i64>,
     dragging_deck_id: Option<i64>,
     dragging_group_id: Option<i64>,
     guided_problem_id: Option<String>,
@@ -458,11 +696,22 @@ pub struct ShuaForgeApp {
 
 impl ShuaForgeApp {
     pub fn new(cc: &eframe::CreationContext<'_>, log_path: Option<PathBuf>) -> Self {
-        configure_fonts(&cc.egui_ctx);
-        cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        Self::new_with_ui_mode(cc, log_path, AppUiMode::Desktop)
+    }
+
+    pub fn new_mobile(cc: &eframe::CreationContext<'_>) -> Self {
+        Self::new_with_ui_mode(cc, None, AppUiMode::Mobile)
+    }
+
+    fn new_with_ui_mode(
+        cc: &eframe::CreationContext<'_>,
+        log_path: Option<PathBuf>,
+        ui_mode: AppUiMode,
+    ) -> Self {
+        configure_fonts(&cc.egui_ctx, MOBILE_TOUCH_HEIGHT);
         log::info!("Initializing ShuaForge application state");
 
-        let mut status = "请导入题库开始练习。支持 JSON / CSV / ZIP 格式。".to_owned();
+        let mut status = "请导入题库开始练习。支持 JSON / CSV / ZIP / 调试快照格式。".to_owned();
         let store = match AppStore::open_default() {
             Ok(store) => {
                 log::info!("Opened local SQLite store");
@@ -481,13 +730,16 @@ impl ShuaForgeApp {
             .unwrap_or_default();
         let theme = AppTheme::from(settings.theme);
         let practice_order = PracticeOrder::from(settings.practice_order);
+        let library_deck_view = LibraryDeckViewMode::from(settings.library_deck_view);
+        apply_formula_render_settings(settings.formula_render.clone());
         let update_settings = store
             .as_ref()
             .and_then(|store| load_persisted_update_settings(store).ok())
             .unwrap_or_default();
-        cc.egui_ctx.set_visuals(theme.visuals());
+        theme.apply_to_context(&cc.egui_ctx);
 
         let mut app = Self {
+            ui_mode,
             deck: None,
             view: AppView::Library,
             store,
@@ -495,6 +747,9 @@ impl ShuaForgeApp {
             answer_input: String::new(),
             selected_single: None,
             selected_multiple: BTreeSet::new(),
+            focused_choice_index: 0,
+            keyboard_choice_focus_visible: false,
+            clear_practice_focus_next_frame: false,
             status,
             analysis: "解析与学习分析结果将在这里显示。".into(),
             loaded_path: None,
@@ -504,6 +759,10 @@ impl ShuaForgeApp {
             analysis_stream_receiver: None,
             chat_receiver: None,
             ai_import_receiver: None,
+            browser_snapshot_receiver: None,
+            sync_receiver: None,
+            sync_server_addr: None,
+            sync_status: "尚未启动局域网同步服务。".into(),
             update_receiver: None,
             update_info: None,
             update_status: "尚未检查更新。".into(),
@@ -517,21 +776,27 @@ impl ShuaForgeApp {
             analysis_generation_id: 0,
             analysis_progress: None,
             analysis_dialog: None,
+            deck_preview: None,
             analysis_dialogs: HashMap::new(),
             active_analysis_key: None,
             analysis_cache: HashMap::new(),
             analysis_sources: HashMap::new(),
             is_ai_loading: false,
             is_ai_importing: false,
+            formula_render_settings: settings.formula_render,
             theme,
             practice_order,
+            library_deck_view,
             deck_cards: Vec::new(),
             group_cards: Vec::new(),
             active_deck_name: None,
             answer_history: Vec::new(),
             bank_count: 0,
             show_about: false,
+            show_text_import_dialog: false,
+            text_import_buffer: String::new(),
             new_group_name: "新题组".into(),
+            selected_deck_ids: BTreeSet::new(),
             dragging_deck_id: None,
             dragging_group_id: None,
             guided_problem_id: None,
@@ -540,8 +805,26 @@ impl ShuaForgeApp {
         app.load_analysis_cache();
         app.load_analysis_text_cache();
         app.refresh_store_state();
+        #[cfg(not(target_os = "android"))]
+        app.start_browser_bridge_on_startup();
+        #[cfg(not(target_os = "android"))]
         app.start_update_check(UpdateCheckSource::Startup);
         app
+    }
+
+    #[cfg(not(target_os = "android"))]
+    fn start_browser_bridge_on_startup(&mut self) {
+        match userscript_server::ensure_bridge_running() {
+            Ok(url) => {
+                log::info!("Browser collection bridge auto-started: {url}");
+            }
+            Err(err) => {
+                log::warn!("Failed to auto-start browser collection bridge: {err}");
+                if self.status.starts_with("请导入题库") {
+                    self.status = format!("浏览器采集服务自启动失败：{err}；仍可导入本地题库。");
+                }
+            }
+        }
     }
 
     fn toggle_theme(&mut self, ctx: &egui::Context) {
@@ -549,7 +832,7 @@ impl ShuaForgeApp {
             AppTheme::Dark => AppTheme::Light,
             AppTheme::Light => AppTheme::Dark,
         };
-        ctx.set_visuals(self.theme.visuals());
+        self.theme.apply_to_context(ctx);
         self.persist_settings();
     }
 
@@ -558,6 +841,8 @@ impl ShuaForgeApp {
             theme: self.theme.into(),
             practice_order: self.practice_order.into(),
             ai_config: self.ai_config.clone(),
+            formula_render: self.formula_render_settings.clone(),
+            library_deck_view: self.library_deck_view.into(),
         }
     }
 
@@ -570,6 +855,7 @@ impl ShuaForgeApp {
         if let Err(err) = store.set_setting(SETTINGS_KEY, &value) {
             self.status = format!("设置保存失败：{err}");
         }
+        apply_formula_render_settings(self.formula_render_settings.clone());
     }
 
     fn theme_button_icon(&self) -> &'static str {
@@ -593,6 +879,12 @@ impl ShuaForgeApp {
         }
     }
 
+    #[cfg(target_os = "android")]
+    fn export_logs(&mut self) {
+        self.status = "Android 端日志导出稍后接入系统分享/文件选择。".into();
+    }
+
+    #[cfg(not(target_os = "android"))]
     fn export_logs(&mut self) {
         let Some(path) = rfd::FileDialog::new()
             .add_filter("日志压缩包", &["zip"])
@@ -769,17 +1061,279 @@ impl ShuaForgeApp {
         }
     }
 
+    fn start_lan_sync_server(&mut self) {
+        match lan_sync::ensure_sync_server_running() {
+            Ok(addr) => {
+                self.sync_server_addr = Some(addr.clone());
+                self.sync_status = format!("同步服务已启动：{addr}");
+                self.status = "局域网同步服务已启动，其他设备稍等几秒即可发现。".into();
+            }
+            Err(err) => {
+                self.sync_status = err.clone();
+                self.status = err;
+            }
+        }
+    }
+
+    fn start_lan_sync_import(&mut self, addr: String, device_name: String) {
+        if self.sync_receiver.is_some() {
+            self.status = "正在同步中，请稍候。".into();
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        self.sync_receiver = Some(receiver);
+        self.sync_status = format!("正在从 {device_name} 拉取题库...");
+        self.status = self.sync_status.clone();
+        thread::spawn(move || {
+            let result = lan_sync::fetch_and_import_from_peer(&addr);
+            let _ = sender.send(result);
+        });
+    }
+
+    fn poll_lan_sync(&mut self) {
+        let Some(receiver) = &self.sync_receiver else {
+            return;
+        };
+        let Ok(result) = receiver.try_recv() else {
+            return;
+        };
+        self.sync_receiver = None;
+        match result {
+            Ok(summary) => {
+                self.refresh_store_state();
+                self.sync_status = format!(
+                    "同步完成：{} 个题库，{} 道题（新增 {}，更新 {}）。",
+                    summary.decks, summary.imported, summary.inserted, summary.updated
+                );
+                self.status = self.sync_status.clone();
+            }
+            Err(err) => {
+                self.sync_status = format!("同步失败：{err}");
+                self.status = self.sync_status.clone();
+            }
+        }
+    }
+
+    #[cfg(target_os = "android")]
     fn import_problem_bank(&mut self) {
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("题库", &["json", "csv", "zip"])
-            .pick_file()
+        match crate::mobile::android::request_problem_bank_file_picker() {
+            Ok(()) => {
+                self.status = "已打开系统文件选择器，请选择 JSON / CSV / ZIP 题库文件。".into();
+            }
+            Err(err) => {
+                self.show_text_import_dialog = true;
+                self.status = format!("{err} 可改用粘贴导入。 ");
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "android"))]
+    fn import_problem_bank(&mut self) {
+        if let Some(paths) = rfd::FileDialog::new()
+            .add_filter("题库 / 调试快照", &["json", "csv", "zip"])
+            .pick_files()
         {
+            if paths.is_empty() {
+                return;
+            }
+            self.import_problem_bank_files(paths);
+        }
+    }
+
+    #[cfg(target_os = "android")]
+    fn request_browser_snapshot_import(&mut self) {
+        self.status = "Android 端不支持油猴浏览器采集，请从桌面同步或导入题库文件。".into();
+    }
+
+    #[cfg(not(target_os = "android"))]
+    fn request_browser_snapshot_import(&mut self) {
+        if self.browser_snapshot_receiver.is_some() {
+            self.status = "已向所有已连接的浏览器页面请求快照，请保持题库页面打开。".into();
+            return;
+        }
+        match userscript_server::request_page_snapshot() {
+            Ok(receiver) => {
+                self.browser_snapshot_receiver = Some(receiver);
+                self.status = "已向所有自动连接的浏览器页面请求题库快照，收到后会逐个导入。".into();
+            }
+            Err(err) => {
+                self.status = format!("请求浏览器快照失败：{err}");
+            }
+        }
+    }
+
+    fn poll_browser_snapshot_import(&mut self) {
+        let Some(receiver) = &self.browser_snapshot_receiver else {
+            return;
+        };
+        let mut snapshots = Vec::new();
+        let mut finished = false;
+        loop {
+            match receiver.try_recv() {
+                Ok(snapshot_json) => snapshots.push(snapshot_json),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    finished = true;
+                    break;
+                }
+            }
+        }
+        if snapshots.is_empty() {
+            if finished {
+                self.browser_snapshot_receiver = None;
+            }
+            return;
+        }
+
+        let mut imported_snapshots = 0usize;
+        let mut imported = 0usize;
+        let mut inserted = 0usize;
+        let mut updated = 0usize;
+        let mut failures = Vec::new();
+        let mut last_imported_path = None;
+        let mut quality = ImportQualitySummary::default();
+        let mut review_requests = Vec::new();
+
+        for snapshot_json in snapshots {
+            match self.import_browser_snapshot_json(&snapshot_json) {
+                Ok(Some(imported_snapshot)) => {
+                    imported_snapshots += 1;
+                    imported += imported_snapshot.imported;
+                    inserted += imported_snapshot.inserted;
+                    updated += imported_snapshot.updated;
+                    quality.add(&imported_snapshot.quality);
+                    last_imported_path = Some(imported_snapshot.path);
+                    if imported_snapshot.imported > 0 {
+                        review_requests
+                            .push((imported_snapshot.director_title, imported_snapshot.problems));
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => failures.push(err),
+            }
+        }
+
+        if imported_snapshots > 0 || !failures.is_empty() {
+            self.finish_problem_import_batch(ProblemImportBatchSummary {
+                imported_files: imported_snapshots,
+                imported,
+                inserted,
+                updated,
+                failures,
+                last_imported_path,
+                quality,
+            });
+            for (title, problems) in review_requests {
+                self.request_ai_director_review(title, problems);
+            }
+            if finished {
+                self.browser_snapshot_receiver = None;
+            } else if self.browser_snapshot_receiver.is_some() {
+                self.status = format!(
+                    "已导入 {imported_snapshots} 个浏览器页面快照；继续等待其他已连接页面回传。"
+                );
+            }
+        }
+    }
+
+    fn import_browser_snapshot_json(
+        &mut self,
+        snapshot_json: &str,
+    ) -> Result<Option<BrowserSnapshotImport>, String> {
+        match load_problems_from_json_text(snapshot_json) {
+            Ok(problems) => {
+                if problems.is_empty() {
+                    return Ok(None);
+                }
+                let quality = ImportQualitySummary::from_problems(&problems);
+                let import_meta = browser_snapshot_import_meta(snapshot_json, &problems);
+                let virtual_path = import_meta.source_path.clone();
+                match self.save_imported_problems(&virtual_path, &problems) {
+                    Ok(summary) => Ok(Some(BrowserSnapshotImport {
+                        path: virtual_path,
+                        director_title: import_meta.director_title,
+                        problems,
+                        quality,
+                        imported: summary.imported,
+                        inserted: summary.inserted,
+                        updated: summary.updated,
+                    })),
+                    Err(err) => Err(format!("浏览器快照保存失败：{err}")),
+                }
+            }
+            Err(err) => Err(format!("浏览器快照解析失败：{err}")),
+        }
+    }
+
+    fn request_ai_director_review(&mut self, title: String, problems: Vec<Problem>) {
+        if problems.is_empty() {
+            return;
+        }
+        let review_count = problems
+            .iter()
+            .filter(|problem| problem.needs_ai_review())
+            .count();
+        let title = format!("AI总监审查 · {title}");
+        self.clear_ai_analysis_records_for_titles(std::slice::from_ref(&title));
+        self.request_problem_set_analysis(title.clone(), problems);
+        self.status = if review_count > 0 {
+            format!("已导入浏览器快照，并交给 AI 总监优先复核 {review_count} 道待确认题。")
+        } else {
+            "已导入浏览器快照，并交给 AI 总监做一致性审查。".into()
+        };
+    }
+
+    fn import_problem_bank_files(&mut self, paths: Vec<PathBuf>) {
+        let mut imported_files = 0usize;
+        let mut imported = 0usize;
+        let mut inserted = 0usize;
+        let mut updated = 0usize;
+        let mut failures = Vec::new();
+        let mut last_imported_path = None;
+        let mut quality = ImportQualitySummary::default();
+
+        for path in paths {
             log::info!("Importing problem bank from {}", path.display());
             match load_problems(&path) {
-                Ok(problems) => self.import_and_load_problems(path, problems),
+                Ok(problems) => match self.save_imported_problems(&path, &problems) {
+                    Ok(summary) => {
+                        quality.add(&ImportQualitySummary::from_problems(&problems));
+                        imported_files += 1;
+                        imported += summary.imported;
+                        inserted += summary.inserted;
+                        updated += summary.updated;
+                        last_imported_path = Some(path);
+                    }
+                    Err(err) => {
+                        log::error!("Saving imported problems to SQLite failed: {err}");
+                        failures.push(format!("{}：保存失败：{err}", path.display()));
+                    }
+                },
                 Err(err) => {
                     log::error!("Problem bank import failed: {err}");
-                    self.status = format!("导入失败：{err}");
+                    failures.push(format!("{}：{err}", path.display()));
+                }
+            }
+        }
+
+        self.finish_problem_import_batch(ProblemImportBatchSummary {
+            imported_files,
+            imported,
+            inserted,
+            updated,
+            failures,
+            last_imported_path,
+            quality,
+        });
+    }
+
+    #[cfg(target_os = "android")]
+    fn poll_android_file_picker_import(&mut self) {
+        while let Some(result) = crate::mobile::android::poll_problem_bank_file_picker_result() {
+            match result {
+                Ok(path) => self.import_problem_bank_files(vec![path]),
+                Err(err) => {
+                    self.status = err;
                 }
             }
         }
@@ -790,74 +1344,219 @@ impl ShuaForgeApp {
             self.status = "AI 正在导入题库，请稍候。".into();
             return;
         }
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("AI 可解析题库", &["csv", "xlsx", "pdf"])
-            .pick_file()
+        #[cfg(target_os = "android")]
         {
+            self.status = "Android 端 AI 导入入口已保留，下一步接入文本粘贴/系统文件选择。".into();
+            return;
+        }
+        #[cfg(not(target_os = "android"))]
+        if let Some(paths) = rfd::FileDialog::new()
+            .add_filter("AI 可解析题库", &["csv", "xlsx", "pdf"])
+            .pick_files()
+        {
+            if paths.is_empty() {
+                return;
+            }
             let config = self.ai_config.clone();
             let (sender, receiver) = mpsc::channel();
             self.ai_import_receiver = Some(receiver);
             self.is_ai_importing = true;
-            self.status = format!("AI 正在解析并导入题库：{}", path.display());
+            self.status = if paths.len() == 1 {
+                format!("AI 正在解析并导入题库：{}", paths[0].display())
+            } else {
+                format!("AI 正在批量解析并导入 {} 个题库文件。", paths.len())
+            };
             thread::spawn(move || {
-                let result =
-                    import_problem_bank_with_ai(&config, &path).map_err(|err| err.to_string());
-                let _ = sender.send(AiImportAsyncResponse { path, result });
+                let responses = paths
+                    .into_iter()
+                    .map(|path| {
+                        let result = import_problem_bank_with_ai(&config, &path)
+                            .map_err(|err| err.to_string());
+                        AiImportAsyncResponse { path, result }
+                    })
+                    .collect();
+                let _ = sender.send(responses);
             });
         }
     }
 
-    fn import_and_load_problems(&mut self, path: PathBuf, problems: Vec<Problem>) {
-        if let Some(store) = self.store.as_mut() {
-            match store.import_problems(&problems, &path.display().to_string()) {
-                Ok(summary) => {
-                    log::info!(
-                        "Imported problem bank: imported={}, inserted={}, updated={}",
-                        summary.imported,
-                        summary.inserted,
-                        summary.updated
-                    );
-                    self.status = format!(
-                        "导入 {} 道题：新增 {}，更新 {}。已保存到题库列表。",
-                        summary.imported, summary.inserted, summary.updated
-                    );
-                    self.active_deck_name = None;
-                }
-                Err(err) => {
-                    log::error!("Saving imported problems to SQLite failed: {err}");
-                    self.status = format!("题库已读入，但保存 SQLite 失败：{err}");
-                }
-            }
+    fn save_imported_problems(
+        &mut self,
+        path: &Path,
+        problems: &[Problem],
+    ) -> Result<crate::store::ImportSummary, Box<dyn std::error::Error + Send + Sync>> {
+        let (summary, deck_name) = {
+            let Some(store) = self.store.as_mut() else {
+                return Err("本地数据库不可用".into());
+            };
+            let summary = store.import_problems(problems, &path.display().to_string())?;
+            let deck_name = store
+                .deck_cards()?
+                .into_iter()
+                .find(|card| card.id == summary.deck_id)
+                .map(|card| card.name);
+            (summary, deck_name)
+        };
+        let titles = self.analysis_titles_affected_by_import(path, deck_name.as_deref());
+        self.clear_ai_analysis_records_for_titles(&titles);
+        log::info!(
+            "Imported problem bank: imported={}, inserted={}, updated={}",
+            summary.imported,
+            summary.inserted,
+            summary.updated
+        );
+        Ok(summary)
+    }
+
+    fn finish_problem_import_batch(&mut self, batch: ProblemImportBatchSummary) {
+        if batch.imported_files > 0 {
+            self.active_deck_name = None;
+            self.loaded_path = batch.last_imported_path;
+            self.deck = None;
+            self.guided_problem_id = None;
+            self.view = AppView::Library;
             self.refresh_store_state();
         }
-        self.loaded_path = Some(path);
-        self.deck = None;
-        self.guided_problem_id = None;
-        self.view = AppView::Library;
+
+        let mut status = if batch.imported_files == 0 {
+            "没有成功导入题库。".to_owned()
+        } else if batch.imported_files == 1 {
+            format!(
+                "导入 {} 道题：新增 {}，更新 {}。已保存到题库列表。",
+                batch.imported, batch.inserted, batch.updated
+            )
+        } else {
+            format!(
+                "批量导入完成：成功 {} 个文件，共 {} 道题；新增 {}，更新 {}。",
+                batch.imported_files, batch.imported, batch.inserted, batch.updated
+            )
+        };
+
+        if !batch.failures.is_empty() {
+            status.push_str(&format!(
+                " 失败 {} 个：{}",
+                batch.failures.len(),
+                batch.failures.join("；")
+            ));
+        }
+        let quality_text = batch.quality.describe();
+        if !quality_text.is_empty() {
+            status.push_str(&format!(" {quality_text}。"));
+        }
+        self.status = status;
+    }
+
+    fn import_problem_bank_text(&mut self) {
+        let text = self.text_import_buffer.trim();
+        if text.is_empty() {
+            self.status = "请先粘贴 JSON 或 CSV 题库文本。".into();
+            return;
+        }
+
+        match load_problems_from_text(text) {
+            Ok(problems) => {
+                let quality = ImportQualitySummary::from_problems(&problems);
+                let virtual_path = PathBuf::from("粘贴导入题库");
+                match self.save_imported_problems(&virtual_path, &problems) {
+                    Ok(summary) => {
+                        self.text_import_buffer.clear();
+                        self.show_text_import_dialog = false;
+                        self.finish_problem_import_batch(ProblemImportBatchSummary {
+                            imported_files: 1,
+                            imported: summary.imported,
+                            inserted: summary.inserted,
+                            updated: summary.updated,
+                            last_imported_path: Some(virtual_path),
+                            quality,
+                            ..Default::default()
+                        });
+                    }
+                    Err(err) => {
+                        self.status = format!("保存粘贴题库失败：{err}");
+                    }
+                }
+            }
+            Err(err) => {
+                self.status = format!("粘贴题库解析失败：{err}");
+            }
+        }
     }
 
     fn poll_ai_import(&mut self) {
         let Some(receiver) = &self.ai_import_receiver else {
             return;
         };
-        let Ok(response) = receiver.try_recv() else {
+        let Ok(responses) = receiver.try_recv() else {
             return;
         };
         self.ai_import_receiver = None;
         self.is_ai_importing = false;
-        match response.result {
-            Ok(result) => {
-                let count = result.problems.len();
-                let extracted_chars = result.extracted_chars;
-                self.import_and_load_problems(response.path, result.problems);
-                self.status = format!(
-                    "AI 导入完成：从约 {extracted_chars} 个字符中提取并导入 {count} 道题。"
-                );
+        let total_files = responses.len();
+        let mut imported_files = 0usize;
+        let mut imported = 0usize;
+        let mut inserted = 0usize;
+        let mut updated = 0usize;
+        let mut extracted_chars = 0usize;
+        let mut failures = Vec::new();
+        let mut last_imported_path = None;
+        let mut quality = ImportQualitySummary::default();
+
+        for response in responses {
+            match response.result {
+                Ok(result) => {
+                    let problem_count = result.problems.len();
+                    extracted_chars += result.extracted_chars;
+                    match self.save_imported_problems(&response.path, &result.problems) {
+                        Ok(summary) => {
+                            quality.add(&ImportQualitySummary::from_problems(&result.problems));
+                            imported_files += 1;
+                            imported += summary.imported;
+                            inserted += summary.inserted;
+                            updated += summary.updated;
+                            last_imported_path = Some(response.path);
+                            log::info!(
+                                "AI imported problem bank: problems={}, extracted_chars={}",
+                                problem_count,
+                                result.extracted_chars
+                            );
+                        }
+                        Err(err) => {
+                            failures.push(format!("{}：保存失败：{err}", response.path.display()))
+                        }
+                    }
+                }
+                Err(err) => {
+                    log::error!("AI problem bank import failed: {err}");
+                    failures.push(format!("{}：{err}", response.path.display()));
+                }
             }
-            Err(err) => {
-                log::error!("AI problem bank import failed: {err}");
-                self.status = format!("AI 导入失败：{err}");
-            }
+        }
+
+        let failure_suffix = if failures.is_empty() {
+            String::new()
+        } else {
+            format!(" 失败 {} 个：{}", failures.len(), failures.join("；"))
+        };
+
+        self.finish_problem_import_batch(ProblemImportBatchSummary {
+            imported_files,
+            imported,
+            inserted,
+            updated,
+            failures,
+            last_imported_path,
+            quality,
+        });
+        if imported_files > 0 {
+            self.status = if total_files == 1 {
+                format!(
+                    "AI 导入完成：从约 {extracted_chars} 个字符中提取并导入 {imported} 道题。{failure_suffix}"
+                )
+            } else {
+                format!(
+                    "AI 批量导入完成：成功 {imported_files}/{total_files} 个文件，从约 {extracted_chars} 个字符中提取并导入 {imported} 道题；新增 {inserted}，更新 {updated}。{failure_suffix}"
+                )
+            };
         }
     }
 
@@ -871,6 +1570,7 @@ impl ShuaForgeApp {
                 self.guided_problem_id = None;
                 self.active_deck_name = Some("全部题库".into());
                 self.view = AppView::Practice;
+                self.prepare_practice_entry();
                 self.status = format!("已从全部题库载入 {count} 道题。");
             }
             Ok(_) => {}
@@ -884,13 +1584,45 @@ impl ShuaForgeApp {
         self.deck_cards = store.deck_cards().unwrap_or_default();
         self.group_cards = store.group_cards().unwrap_or_default();
         self.answer_history = store.answer_history(8).unwrap_or_default();
+        let available_deck_ids = self
+            .deck_cards
+            .iter()
+            .map(|card| card.id)
+            .collect::<BTreeSet<_>>();
+        self.selected_deck_ids
+            .retain(|deck_id| available_deck_ids.contains(deck_id));
+    }
+
+    fn set_deck_selected(&mut self, deck_id: i64, selected: bool) {
+        if selected {
+            self.selected_deck_ids.insert(deck_id);
+        } else {
+            self.selected_deck_ids.remove(&deck_id);
+        }
+    }
+
+    fn deck_drag_ids(&self, deck_id: i64) -> Vec<i64> {
+        if self.selected_deck_ids.contains(&deck_id) {
+            self.selected_deck_ids.iter().copied().collect()
+        } else {
+            vec![deck_id]
+        }
+    }
+
+    fn is_deck_dragging(&self, deck_id: i64) -> bool {
+        let Some(dragging_deck_id) = self.dragging_deck_id else {
+            return false;
+        };
+        dragging_deck_id == deck_id
+            || (self.selected_deck_ids.contains(&dragging_deck_id)
+                && self.selected_deck_ids.contains(&deck_id))
     }
 
     fn restart_from_store(&mut self) {
         self.load_bank_from_store();
         self.loaded_path = None;
         self.active_deck_name = Some("全部题库".into());
-        self.clear_answer_inputs();
+        self.prepare_practice_entry();
         self.analysis.clear();
     }
 
@@ -909,12 +1641,293 @@ impl ShuaForgeApp {
                 self.active_deck_name = Some(deck_name.clone());
                 self.loaded_path = None;
                 self.view = AppView::Practice;
-                self.clear_answer_inputs();
+                self.prepare_practice_entry();
                 self.analysis.clear();
                 self.status = format!("已开始题库「{deck_name}」，共 {count} 道题。");
             }
             Ok(_) => self.status = format!("题库「{deck_name}」为空。"),
             Err(err) => self.status = format!("读取题库失败：{err}"),
+        }
+    }
+
+    fn preview_deck_card(&mut self, deck_id: i64, deck_name: String) {
+        let Some(store) = &self.store else {
+            self.status = "本地数据库不可用。".into();
+            return;
+        };
+
+        match store.load_deck_problems(deck_id) {
+            Ok(problems) if !problems.is_empty() => {
+                let count = problems.len();
+                self.deck_preview = Some(DeckPreviewState {
+                    deck_id,
+                    deck_name: deck_name.clone(),
+                    problems,
+                    open: true,
+                    editing_problem_id: None,
+                    editing_answer: String::new(),
+                });
+                self.status = format!("正在预览题库「{deck_name}」，共 {count} 道题。");
+            }
+            Ok(_) => self.status = format!("题库「{deck_name}」为空。"),
+            Err(err) => self.status = format!("读取题库预览失败：{err}"),
+        }
+    }
+
+    #[cfg(target_os = "android")]
+    fn export_problem_bank(&mut self, _title: String, _info: String, _problems: Vec<Problem>) {
+        self.status = "Android 端题库导出稍后接入系统分享/文件保存。".into();
+    }
+
+    #[cfg(not(target_os = "android"))]
+    fn export_problem_bank(&mut self, title: String, info: String, problems: Vec<Problem>) {
+        if problems.is_empty() {
+            self.status = format!("{title} 没有可导出的题目。");
+            return;
+        }
+
+        let default_name = default_export_file_name(&title, "zip");
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("ShuaForge 题库包", &["zip"])
+            .add_filter("JSON 题库", &["json"])
+            .set_file_name(default_name)
+            .save_file()
+        else {
+            return;
+        };
+
+        let bank = ExportProblemBank::new(title.clone(), info, problems);
+        let result = match path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("json") => export_problem_bank_json(&path, &bank),
+            _ => export_problem_bank_zip(&path, &bank),
+        };
+
+        match result {
+            Ok(()) => {
+                self.status = format!(
+                    "已导出「{}」共 {} 道题到：{}",
+                    bank.deck_name,
+                    bank.problem_count,
+                    path.display()
+                );
+            }
+            Err(err) => {
+                self.status = format!("导出「{title}」失败：{err}");
+            }
+        }
+    }
+
+    fn export_deck_card(&mut self, deck_id: i64, deck_name: String) {
+        let Some(store) = &self.store else {
+            self.status = "本地数据库不可用。".into();
+            return;
+        };
+
+        match store.load_deck_problems(deck_id) {
+            Ok(problems) => {
+                let info = self
+                    .deck_cards
+                    .iter()
+                    .find(|card| card.id == deck_id)
+                    .map(|card| {
+                        format!(
+                            "来源：{}；更新时间：{}；新增 {}；更新 {}",
+                            card.source_path, card.updated_at, card.inserted, card.updated
+                        )
+                    })
+                    .unwrap_or_default();
+                self.export_problem_bank(deck_name, info, problems);
+            }
+            Err(err) => self.status = format!("读取题库失败：{err}"),
+        }
+    }
+
+    fn export_group_card(&mut self, group_id: i64, group_name: String) {
+        let Some(store) = &self.store else {
+            self.status = "本地数据库不可用。".into();
+            return;
+        };
+
+        match store.load_group_problems(group_id) {
+            Ok(problems) => {
+                let info = store
+                    .group_decks(group_id)
+                    .map(|decks| {
+                        let names = decks
+                            .iter()
+                            .map(|deck| format!("{}（{}题）", deck.name, deck.problem_count))
+                            .collect::<Vec<_>>()
+                            .join("；");
+                        if names.is_empty() {
+                            "题组导出：暂无题库明细".into()
+                        } else {
+                            format!("题组导出：包含 {} 个题库：{}", decks.len(), names)
+                        }
+                    })
+                    .unwrap_or_default();
+                self.export_problem_bank(format!("题组-{}", group_name), info, problems);
+            }
+            Err(err) => self.status = format!("读取题组失败：{err}"),
+        }
+    }
+
+    fn render_deck_preview_dialog(&mut self, ctx: &egui::Context) {
+        let Some(preview) = self.deck_preview.clone() else {
+            return;
+        };
+
+        let mut open = preview.open;
+        let mut close_requested = false;
+        let mut start_requested = false;
+        let mut analyze_requested = false;
+        let mut export_requested = false;
+        let mut editing_problem_id = preview.editing_problem_id.clone();
+        let mut editing_answer = preview.editing_answer.clone();
+        let mut save_answer: Option<(String, String)> = None;
+        egui::Window::new(format!("题库预览 · {}", preview.deck_name))
+            .id(egui::Id::new(("deck_preview", preview.deck_id)))
+            .open(&mut open)
+            .default_width(760.0)
+            .default_height(620.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                let quality = ImportQualitySummary::from_problems(&preview.problems);
+                ui.horizontal_wrapped(|ui| {
+                    ui.heading(&preview.deck_name);
+                    ui.label(format!("共 {} 道题", preview.problems.len()));
+                });
+                ui.small(quality.describe());
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("开始练习此题库").clicked() {
+                        start_requested = true;
+                        close_requested = true;
+                    }
+                    if ui.button("AI总监审查此题库").clicked() {
+                        analyze_requested = true;
+                    }
+                    if ui.button("导出题库").clicked() {
+                        export_requested = true;
+                    }
+                    if ui.button("关闭").clicked() {
+                        close_requested = true;
+                    }
+                });
+                ui.separator();
+
+                egui::ScrollArea::vertical()
+                    .id_salt(("deck_preview_scroll", preview.deck_id))
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for (index, problem) in preview.problems.iter().enumerate() {
+                            let is_editing = editing_problem_id.as_deref() == Some(&problem.id);
+                            match render_problem_preview_row(
+                                ui,
+                                index,
+                                problem,
+                                is_editing,
+                                &mut editing_answer,
+                            ) {
+                                Some(ProblemPreviewAction::Start { problem_id, answer }) => {
+                                    editing_problem_id = Some(problem_id);
+                                    editing_answer = answer;
+                                }
+                                Some(ProblemPreviewAction::Save { problem_id, answer }) => {
+                                    save_answer = Some((problem_id, answer));
+                                }
+                                Some(ProblemPreviewAction::Cancel) => {
+                                    editing_problem_id = None;
+                                    editing_answer.clear();
+                                }
+                                None => {}
+                            }
+                            ui.add_space(8.0);
+                        }
+                    });
+            });
+
+        if start_requested {
+            self.start_deck_card(preview.deck_id, preview.deck_name.clone());
+        }
+        if analyze_requested {
+            self.request_problem_set_analysis(
+                format!("题库：{}", preview.deck_name),
+                preview.problems.clone(),
+            );
+        }
+        if export_requested {
+            self.export_deck_card(preview.deck_id, preview.deck_name.clone());
+        }
+        if let Some((problem_id, answer)) = save_answer {
+            self.save_preview_problem_answer(
+                preview.deck_id,
+                &preview.deck_name,
+                &problem_id,
+                &answer,
+            );
+            editing_problem_id = None;
+            editing_answer.clear();
+        }
+
+        if close_requested || !open || start_requested {
+            self.deck_preview = None;
+        } else if let Some(preview) = &mut self.deck_preview {
+            preview.open = open;
+            preview.editing_problem_id = editing_problem_id;
+            preview.editing_answer = editing_answer;
+        }
+    }
+
+    fn save_preview_problem_answer(
+        &mut self,
+        deck_id: i64,
+        deck_name: &str,
+        problem_id: &str,
+        answer: &str,
+    ) {
+        if answer.trim().is_empty() {
+            self.status = "人工修正答案不能为空。".into();
+            return;
+        }
+
+        let result = if let Some(store) = &mut self.store {
+            store
+                .update_problem_manual_answer(problem_id, answer)
+                .and_then(|updated| {
+                    let problems = store.load_deck_problems(deck_id)?;
+                    Ok((updated, problems))
+                })
+        } else {
+            Err("本地数据库不可用。".into())
+        };
+
+        match result {
+            Ok((0, _)) => {
+                self.status = format!("未找到题目 {problem_id}，答案未修改。");
+            }
+            Ok((_, problems)) => {
+                if let Some(preview) = &mut self.deck_preview
+                    && preview.deck_id == deck_id
+                {
+                    preview.problems = problems;
+                    preview.editing_problem_id = None;
+                    preview.editing_answer.clear();
+                }
+                let cleared =
+                    self.clear_ai_analysis_records_for_titles(&[format!("题库：{deck_name}")]);
+                self.status = if cleared > 0 {
+                    format!("已人工修正题目 {problem_id} 的标准答案，并清理旧 AI 总监缓存。")
+                } else {
+                    format!("已人工修正题目 {problem_id} 的标准答案。")
+                };
+            }
+            Err(err) => {
+                self.status = format!("人工修正答案失败：{err}");
+            }
         }
     }
 
@@ -933,7 +1946,7 @@ impl ShuaForgeApp {
                 self.active_deck_name = Some(format!("题组：{group_name}"));
                 self.loaded_path = None;
                 self.view = AppView::Practice;
-                self.clear_answer_inputs();
+                self.prepare_practice_entry();
                 self.analysis.clear();
                 self.status = format!("已开始题组「{group_name}」，共 {count} 道题。");
             }
@@ -972,6 +1985,35 @@ impl ShuaForgeApp {
         }
     }
 
+    fn add_decks_to_group(&mut self, deck_ids: &[i64], group_id: i64, group_name: &str) {
+        if deck_ids.is_empty() {
+            return;
+        }
+        if let [deck_id] = deck_ids {
+            self.add_deck_to_group(*deck_id, group_id, group_name);
+            return;
+        }
+        let Some(store) = &self.store else {
+            self.status = "本地数据库不可用。".into();
+            return;
+        };
+        let mut added = 0usize;
+        let mut failed = 0usize;
+        for deck_id in deck_ids {
+            match store.add_deck_to_group(group_id, *deck_id) {
+                Ok(()) => added += 1,
+                Err(_) => failed += 1,
+            }
+        }
+        self.dragging_deck_id = None;
+        self.refresh_store_state();
+        self.status = if failed == 0 {
+            format!("已把 {added} 个题库加入题组「{group_name}」。")
+        } else {
+            format!("已把 {added} 个题库加入题组「{group_name}」，{failed} 个失败。")
+        };
+    }
+
     fn remove_deck_from_group(&mut self, deck_id: i64, group_id: i64, group_name: &str) {
         let Some(store) = &self.store else {
             self.status = "本地数据库不可用。".into();
@@ -987,37 +2029,235 @@ impl ShuaForgeApp {
     }
 
     fn delete_deck(&mut self, deck_id: i64, deck_name: &str) {
+        let analysis_titles = self.analysis_titles_affected_by_deck(deck_id, deck_name);
         let Some(store) = self.store.as_mut() else {
             self.status = "本地数据库不可用。".into();
             return;
         };
 
-        match store.delete_deck(deck_id) {
+        let delete_result = store.delete_deck(deck_id);
+        match delete_result {
             Ok(()) => {
-                self.status = format!("已删除题库「{deck_name}」。");
+                let cleared = self.clear_ai_analysis_records_for_titles(&analysis_titles);
+                self.status = if cleared > 0 {
+                    format!("已删除题库「{deck_name}」，并清理 {cleared} 条相关 AI 分析记录。")
+                } else {
+                    format!("已删除题库「{deck_name}」。")
+                };
                 self.dragging_deck_id = None;
                 self.dragging_group_id = None;
+                if self
+                    .deck_preview
+                    .as_ref()
+                    .is_some_and(|preview| preview.deck_id == deck_id)
+                {
+                    self.deck_preview = None;
+                }
                 self.refresh_store_state();
             }
             Err(err) => self.status = format!("删除题库失败：{err}"),
         }
     }
 
+    fn delete_decks(&mut self, deck_ids: &[i64]) {
+        if deck_ids.is_empty() {
+            return;
+        }
+        if let [deck_id] = deck_ids
+            && let Some(card) = self
+                .deck_cards
+                .iter()
+                .find(|card| card.id == *deck_id)
+                .cloned()
+        {
+            self.delete_deck(card.id, &card.name);
+            return;
+        }
+        let cards = deck_ids
+            .iter()
+            .filter_map(|deck_id| {
+                self.deck_cards
+                    .iter()
+                    .find(|card| card.id == *deck_id)
+                    .cloned()
+            })
+            .collect::<Vec<_>>();
+        let mut deleted = 0usize;
+        let mut failed = 0usize;
+        for card in cards {
+            let analysis_titles = self.analysis_titles_affected_by_deck(card.id, &card.name);
+            let Some(store) = self.store.as_mut() else {
+                self.status = "本地数据库不可用。".into();
+                return;
+            };
+            match store.delete_deck(card.id) {
+                Ok(()) => {
+                    deleted += 1;
+                    self.clear_ai_analysis_records_for_titles(&analysis_titles);
+                    if self
+                        .deck_preview
+                        .as_ref()
+                        .is_some_and(|preview| preview.deck_id == card.id)
+                    {
+                        self.deck_preview = None;
+                    }
+                }
+                Err(_) => failed += 1,
+            }
+        }
+        self.dragging_deck_id = None;
+        self.dragging_group_id = None;
+        for deck_id in deck_ids {
+            self.selected_deck_ids.remove(deck_id);
+        }
+        self.refresh_store_state();
+        self.status = if failed == 0 {
+            format!("已删除 {deleted} 个题库。")
+        } else {
+            format!("已删除 {deleted} 个题库，{failed} 个删除失败。")
+        };
+    }
+
     fn delete_group(&mut self, group_id: i64, group_name: &str) {
+        let analysis_titles = vec![format!("题组：{group_name}")];
         let Some(store) = &self.store else {
             self.status = "本地数据库不可用。".into();
             return;
         };
 
-        match store.delete_group(group_id) {
+        let delete_result = store.delete_group(group_id);
+        match delete_result {
             Ok(()) => {
-                self.status = format!("已删除题组「{group_name}」。");
+                let cleared = self.clear_ai_analysis_records_for_titles(&analysis_titles);
+                self.status = if cleared > 0 {
+                    format!("已删除题组「{group_name}」，并清理 {cleared} 条相关 AI 分析记录。")
+                } else {
+                    format!("已删除题组「{group_name}」。")
+                };
                 self.dragging_group_id = None;
                 self.dragging_deck_id = None;
                 self.refresh_store_state();
             }
             Err(err) => self.status = format!("删除题组失败：{err}"),
         }
+    }
+
+    fn analysis_titles_affected_by_deck(&self, deck_id: i64, deck_name: &str) -> Vec<String> {
+        let mut titles = vec![format!("题库：{deck_name}")];
+        if let Some(card) = self.deck_cards.iter().find(|card| card.id == deck_id)
+            && let Some(title) = import_director_analysis_title(
+                &PathBuf::from(&card.source_path),
+                Some(card.name.as_str()),
+            )
+        {
+            titles.push(title);
+        }
+        let Some(store) = &self.store else {
+            return titles;
+        };
+        for group in &self.group_cards {
+            let Ok(group_decks) = store.group_decks(group.id) else {
+                continue;
+            };
+            if group_decks.iter().any(|deck| deck.id == deck_id) {
+                titles.push(format!("题组：{}", group.name));
+            }
+        }
+        titles
+    }
+
+    fn analysis_titles_affected_by_import(
+        &self,
+        path: &Path,
+        deck_name: Option<&str>,
+    ) -> Vec<String> {
+        let mut titles = Vec::new();
+        if let Some(deck_name) = deck_name.map(str::trim).filter(|name| !name.is_empty()) {
+            titles.push(format!("题库：{deck_name}"));
+        }
+        if let Some(title) = import_director_analysis_title(path, deck_name) {
+            titles.push(title);
+        }
+        titles
+    }
+
+    fn clear_ai_analysis_records_for_titles(&mut self, titles: &[String]) -> usize {
+        if titles.is_empty() {
+            return 0;
+        }
+
+        let should_remove = |key: &AnalysisCacheKey| titles.iter().any(|title| title == &key.title);
+        let mut removed = 0usize;
+        let mut latest_text_removed = false;
+
+        let cache_keys = self
+            .analysis_cache
+            .keys()
+            .filter(|key| should_remove(key))
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in cache_keys {
+            if let Some(dialog) = self.analysis_cache.remove(&key) {
+                latest_text_removed |= !dialog.latest_result.trim().is_empty()
+                    && dialog.latest_result == self.analysis;
+                removed += 1;
+            }
+        }
+
+        let dialog_keys = self
+            .analysis_dialogs
+            .keys()
+            .filter(|key| should_remove(key))
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in dialog_keys {
+            if let Some(dialog) = self.analysis_dialogs.remove(&key) {
+                latest_text_removed |= !dialog.latest_result.trim().is_empty()
+                    && dialog.latest_result == self.analysis;
+            }
+        }
+
+        let source_keys = self
+            .analysis_sources
+            .keys()
+            .filter(|key| should_remove(key))
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in source_keys {
+            self.analysis_sources.remove(&key);
+        }
+
+        if self
+            .analysis_dialog
+            .as_ref()
+            .is_some_and(|dialog| titles.iter().any(|title| title == &dialog.title))
+        {
+            if let Some(dialog) = &self.analysis_dialog {
+                latest_text_removed |= !dialog.latest_result.trim().is_empty()
+                    && dialog.latest_result == self.analysis;
+                if !self.analysis_cache.contains_key(&AnalysisCacheKey {
+                    kind: dialog.kind,
+                    title: dialog.title.clone(),
+                }) {
+                    removed += 1;
+                }
+            }
+            self.analysis_dialog = None;
+        }
+
+        if self.active_analysis_key.as_ref().is_some_and(should_remove) {
+            self.active_analysis_key = None;
+            latest_text_removed = true;
+        }
+
+        if latest_text_removed {
+            self.analysis.clear();
+            self.persist_analysis_text();
+        }
+        if removed > 0 {
+            self.persist_analysis_cache();
+        }
+        removed
     }
 
     fn remove_deck_from_all_groups(&mut self, deck_id: i64, deck_name: &str) {
@@ -1050,6 +2290,7 @@ impl ShuaForgeApp {
         self.active_deck_name = None;
         self.guided_problem_id = None;
         self.clear_answer_inputs();
+        self.reset_keyboard_choice_focus_mode();
         self.analysis.clear();
         self.refresh_store_state();
     }
@@ -1058,6 +2299,16 @@ impl ShuaForgeApp {
         self.answer_input.clear();
         self.selected_single = None;
         self.selected_multiple.clear();
+        self.focused_choice_index = 0;
+    }
+
+    fn reset_keyboard_choice_focus_mode(&mut self) {
+        self.keyboard_choice_focus_visible = false;
+    }
+
+    fn prepare_practice_entry(&mut self) {
+        self.clear_answer_inputs();
+        self.reset_keyboard_choice_focus_mode();
     }
 
     fn current_practice_session_key(&self) -> Option<String> {
@@ -1090,7 +2341,7 @@ impl ShuaForgeApp {
             Some(deck) => {
                 self.deck = Some(deck);
                 self.view = AppView::Practice;
-                self.clear_answer_inputs();
+                self.prepare_practice_entry();
                 self.analysis.clear();
                 self.status = "已恢复上次退出/返回前的练习进度。".into();
             }
@@ -1146,6 +2397,12 @@ impl ShuaForgeApp {
     }
 
     fn load_ai_config(&mut self) {
+        #[cfg(target_os = "android")]
+        {
+            self.status = "Android 端暂不支持从文件导入 AI 配置，请直接在设置页填写。".into();
+            return;
+        }
+        #[cfg(not(target_os = "android"))]
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("AI 配置", &["json"])
             .pick_file()
@@ -1163,6 +2420,12 @@ impl ShuaForgeApp {
     }
 
     fn save_ai_config(&mut self) {
+        #[cfg(target_os = "android")]
+        {
+            self.status = "Android 端暂不支持导出 AI 配置文件。".into();
+            return;
+        }
+        #[cfg(not(target_os = "android"))]
         let path = self.ai_config_path.clone().or_else(|| {
             rfd::FileDialog::new()
                 .add_filter("AI 配置", &["json"])
@@ -1170,14 +2433,17 @@ impl ShuaForgeApp {
                 .save_file()
         });
 
-        let Some(path) = path else { return };
-        match save_ai_config(&path, &self.ai_config) {
-            Ok(()) => {
-                self.ai_config_path = Some(path);
-                self.persist_settings();
-                self.status = "AI 配置已保存。".into();
+        #[cfg(not(target_os = "android"))]
+        {
+            let Some(path) = path else { return };
+            match save_ai_config(&path, &self.ai_config) {
+                Ok(()) => {
+                    self.ai_config_path = Some(path);
+                    self.persist_settings();
+                    self.status = "AI 配置已保存。".into();
+                }
+                Err(err) => self.status = format!("AI 配置保存失败：{err}"),
             }
-            Err(err) => self.status = format!("AI 配置保存失败：{err}"),
         }
     }
 
@@ -1233,12 +2499,12 @@ impl ShuaForgeApp {
             } => {
                 self.record_answer(&problem, &user_answer, false);
                 self.status = format!("回答错误，已重新加入题库。标准答案：{expected}");
-                self.analysis = if explanation.trim().is_empty() {
-                    "正在准备解析...".into()
+                if explanation.trim().is_empty() {
+                    self.analysis = "本题暂无预生成解析，正在临时请求 AI 解析...".into();
+                    self.request_ai_analysis(problem, user_answer);
                 } else {
-                    explanation
-                };
-                self.request_ai_analysis(problem, user_answer);
+                    self.analysis = explanation;
+                }
             }
             SubmitResult::NoCurrentProblem => self.status = "当前没有题目。".into(),
         }
@@ -1293,10 +2559,20 @@ impl ShuaForgeApp {
     }
 
     fn request_solution_guide(&mut self) {
+        if self.is_ai_loading {
+            self.status = "AI 正在生成中，请稍等当前请求完成。".into();
+            return;
+        }
+
         let Some(problem) = self.deck.as_ref().and_then(|deck| deck.current()).cloned() else {
             self.status = "当前没有可讲解的题目。".into();
             return;
         };
+
+        if self.guided_problem_id.as_deref() == Some(problem.id.as_str()) {
+            self.status = "AI 引导已经为当前题发起，请等待结果。".into();
+            return;
+        }
 
         if let Some(deck) = &mut self.deck {
             deck.requeue_current_without_advancing();
@@ -1414,22 +2690,27 @@ impl ShuaForgeApp {
         let dialog = AnalysisDialogState::loading(
             title.clone(),
             AnalysisKind::ProblemSet,
-            "shuaforge.analyze_problem_set",
+            "shuaforge.ai_director_review_problem_set",
             serde_json::json!({
                 "title": title,
                 "problem_count": problems.len(),
                 "data_access": "local_compact_full_dataset",
                 "available_tools": ["shuaforge.local_compact_problem_set"],
-                "analysis_dimensions": ["problem_type", "difficulty", "knowledge_points", "practice_order"]
+                "review_pipeline": ["deterministic_cleanup", "pending_problem_ai_review", "knowledge_point_annotation", "director_quality_report"],
+                "analysis_dimensions": ["data_quality", "answer_source", "review_status", "problem_type", "knowledge_points", "practice_order"]
             })
             .to_string(),
         );
         self.analysis_dialogs.insert(key.clone(), dialog.clone());
         self.analysis_dialog = Some(dialog);
         self.active_analysis_key = Some(key);
-        self.status = format!("正在分析{title}...");
-        self.analysis = "正在生成题目分析，请稍候...".into();
-        self.analysis_progress = Some(AnalysisProgressState::new("准备分析", 0, problems.len()));
+        self.status = format!("AI 总监正在审查{title}...");
+        self.analysis = "AI 总监正在审查题库质量，请稍候...".into();
+        self.analysis_progress = Some(AnalysisProgressState::new(
+            "准备 AI 总监审查",
+            0,
+            problems.len(),
+        ));
 
         thread::spawn(move || {
             let (event_sender, event_receiver) = mpsc::channel();
@@ -1459,6 +2740,19 @@ impl ShuaForgeApp {
                 }),
             );
             let _ = event_sender.send(AnalysisStreamEvent::ReviewCompleted(problems.clone()));
+            let explanation_progress_sender = event_sender.clone();
+            let problems = pre_generate_explanations_with_progress(
+                &config,
+                problems,
+                Some(&move |current, total| {
+                    let _ = explanation_progress_sender.send(AnalysisStreamEvent::Progress {
+                        label: "AI 并发预生成题目解析".into(),
+                        current,
+                        total,
+                    });
+                }),
+            );
+            let _ = event_sender.send(AnalysisStreamEvent::ExplanationsGenerated(problems.clone()));
             let progress_sender = event_sender.clone();
             let problems = annotate_problem_knowledge_points_with_progress(
                 &config,
@@ -1472,7 +2766,7 @@ impl ShuaForgeApp {
                 }),
             );
             let _ = event_sender.send(AnalysisStreamEvent::Progress {
-                label: "整理并压缩题库数据".into(),
+                label: "AI 总监整理审查数据".into(),
                 current: 1,
                 total: 1,
             });
@@ -1806,19 +3100,19 @@ impl ShuaForgeApp {
                         }
                     }
                 }
-                AnalysisStreamEvent::ReviewCompleted(problems) => {
+                AnalysisStreamEvent::ExplanationsGenerated(problems) => {
                     if let Some(store) = &mut self.store {
-                        match store.update_problems_after_ai_review(&problems) {
+                        match store.update_problem_explanations(&problems) {
                             Ok(updated) if updated > 0 => {
-                                self.status =
-                                    format!("已统一复核并保存 {updated} 道题，正在继续分析...");
-                                self.refresh_store_state();
+                                self.status = format!(
+                                    "已保存 {updated} 道题的 AI 预生成解析，正在继续分析..."
+                                );
                             }
                             Ok(_) => {
-                                self.status = "没有需要保存的 AI 复核结果，正在继续分析...".into();
+                                self.status = "AI 预生成解析无需更新，正在继续分析...".into();
                             }
                             Err(err) => {
-                                self.status = format!("AI 复核结果保存失败：{err}");
+                                self.status = format!("AI 预生成解析保存失败：{err}");
                             }
                         }
                     }
@@ -1833,22 +3127,56 @@ impl ShuaForgeApp {
                         }
                     }
                 }
+                AnalysisStreamEvent::ReviewCompleted(problems) => {
+                    let review_summary = ai_review_action_summary(&problems);
+                    let persisted_result = if let Some(store) = &mut self.store {
+                        store.update_ai_review_accepted_answers(&problems)
+                    } else {
+                        Ok(0)
+                    };
+                    self.status = match persisted_result {
+                        Ok(persisted) if persisted > 0 => {
+                            format!(
+                                "AI 复核已写回 {persisted} 道高置信参考答案：{review_summary}，正在继续生成总监报告..."
+                            )
+                        }
+                        Ok(_) => {
+                            format!(
+                                "AI 复核未产生可安全写回的参考答案：{review_summary}，正在继续生成总监报告..."
+                            )
+                        }
+                        Err(err) => format!(
+                            "AI 复核答案写回失败：{err}；{review_summary}，仍将继续生成总监报告..."
+                        ),
+                    };
+                    if let Some(dialog) = &self.analysis_dialog {
+                        let key = AnalysisCacheKey {
+                            kind: dialog.kind,
+                            title: dialog.title.clone(),
+                        };
+                        if matches!(dialog.kind, AnalysisKind::ProblemSet) {
+                            self.analysis_sources
+                                .insert(key, AnalysisSource::Problems(problems));
+                        }
+                    }
+                }
                 AnalysisStreamEvent::ToolCall { arguments_json } => {
                     self.analysis_progress =
-                        Some(AnalysisProgressState::new("AI 正在生成分析报告", 0, 0));
+                        Some(AnalysisProgressState::new("AI 总监正在生成审查报告", 0, 0));
                     if let Some(dialog) = &mut self.analysis_dialog
                         && let Some(tool_message) = dialog
                             .messages
                             .iter_mut()
                             .find(|message| message.role == ChatRole::Tool)
                     {
-                        tool_message.title = "Tool Call · shuaforge.analyze_problem_set".into();
+                        tool_message.title =
+                            "Tool Call · shuaforge.ai_director_review_problem_set".into();
                         tool_message.content = arguments_json;
                     }
                 }
                 AnalysisStreamEvent::TextDelta(delta) => {
                     self.analysis_progress =
-                        Some(AnalysisProgressState::new("AI 正在生成分析报告", 0, 0));
+                        Some(AnalysisProgressState::new("AI 总监正在生成审查报告", 0, 0));
                     self.analysis.push_str(&delta);
                     if let Some(dialog) = &mut self.analysis_dialog {
                         if let Some(assistant_message) = dialog
@@ -1857,7 +3185,9 @@ impl ShuaForgeApp {
                             .rev()
                             .find(|message| message.role == ChatRole::Assistant)
                         {
-                            if assistant_message.content == "正在分析，请稍候..." {
+                            if assistant_message.content == "正在分析，请稍候..."
+                                || assistant_message.content == "AI 总监正在审查，请稍候..."
+                            {
                                 assistant_message.content.clear();
                             }
                             assistant_message.content.push_str(&delta);
@@ -1867,7 +3197,7 @@ impl ShuaForgeApp {
                     self.persist_analysis_text();
                 }
                 AnalysisStreamEvent::Finished => {
-                    self.status = "分析完成。".into();
+                    self.status = "AI 总监审查完成。".into();
                     self.analysis_progress = None;
                     if let Some(dialog) = &mut self.analysis_dialog {
                         dialog.is_loading = false;
@@ -2061,40 +3391,105 @@ impl ShuaForgeApp {
     }
 
     fn render_library_home(&mut self, ui: &mut egui::Ui) {
+        let narrow = self.ui_mode == AppUiMode::Mobile;
+        let compact_cards = ui.available_width() < 600.0;
         ui.horizontal_wrapped(|ui| {
             ui.heading("题库主页");
-            ui.label("集中管理题库与题组");
+            if !narrow {
+                ui.label("集中管理题库与题组");
+            }
         });
         ui.label("可将题库加入题组，按章节、课程或专题组织练习内容。");
         ui.add_space(10.0);
 
-        ui.horizontal_wrapped(|ui| {
-            if ui.button("导入新题库").clicked() {
+        if narrow {
+            if ui
+                .add_sized(
+                    [ui.available_width(), MOBILE_TOUCH_HEIGHT],
+                    egui::Button::new("导入题库"),
+                )
+                .clicked()
+            {
                 self.import_problem_bank();
             }
             if ui
-                .add_enabled(!self.is_ai_importing, egui::Button::new("AI导入题库"))
+                .add_sized(
+                    [ui.available_width(), MOBILE_TOUCH_HEIGHT],
+                    egui::Button::new("AI 导入"),
+                )
                 .clicked()
             {
                 self.import_problem_bank_with_ai_dialog();
             }
             if self.is_ai_importing {
-                ui.spinner();
-                ui.label("AI 导入中");
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("AI 导入中");
+                });
             }
-            if ui.button("练习全部题库").clicked() {
+            if ui
+                .add_sized(
+                    [ui.available_width(), MOBILE_TOUCH_HEIGHT],
+                    egui::Button::new("练习全部题库"),
+                )
+                .clicked()
+            {
                 self.restart_from_store();
             }
-            if self.has_saved_practice_session() && ui.button("继续上次练习").clicked() {
+            if self.has_saved_practice_session()
+                && ui
+                    .add_sized(
+                        [ui.available_width(), MOBILE_TOUCH_HEIGHT],
+                        egui::Button::new("继续上次练习"),
+                    )
+                    .clicked()
+            {
                 self.continue_latest_practice_session();
             }
-            ui.separator();
-            ui.label("新题组");
-            ui.text_edit_singleline(&mut self.new_group_name);
-            if ui.button("创建题组").clicked() {
-                self.create_group();
-            }
-        });
+            ui.horizontal(|ui| {
+                ui.add_sized(
+                    [ui.available_width() - 82.0, MOBILE_TOUCH_HEIGHT],
+                    egui::TextEdit::singleline(&mut self.new_group_name).hint_text("新题组名称"),
+                );
+                if ui
+                    .add_sized([76.0, MOBILE_TOUCH_HEIGHT], egui::Button::new("创建"))
+                    .clicked()
+                {
+                    self.create_group();
+                }
+            });
+        } else {
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("导入新题库").clicked() {
+                    self.import_problem_bank();
+                }
+                if ui.button("从浏览器获取题库").clicked() {
+                    self.request_browser_snapshot_import();
+                }
+                if ui
+                    .add_enabled(!self.is_ai_importing, egui::Button::new("AI导入题库"))
+                    .clicked()
+                {
+                    self.import_problem_bank_with_ai_dialog();
+                }
+                if self.is_ai_importing {
+                    ui.spinner();
+                    ui.label("AI 导入中");
+                }
+                if ui.button("练习全部题库").clicked() {
+                    self.restart_from_store();
+                }
+                if self.has_saved_practice_session() && ui.button("继续上次练习").clicked() {
+                    self.continue_latest_practice_session();
+                }
+                ui.separator();
+                ui.label("新题组");
+                ui.text_edit_singleline(&mut self.new_group_name);
+                if ui.button("创建题组").clicked() {
+                    self.create_group();
+                }
+            });
+        }
 
         ui.add_space(10.0);
         let trash_response = render_trash_zone(
@@ -2102,14 +3497,9 @@ impl ShuaForgeApp {
             self.dragging_deck_id.is_some() || self.dragging_group_id.is_some(),
         );
         if trash_response.hovered() && ui.input(|input| input.pointer.any_released()) {
-            if let Some(deck_id) = self.dragging_deck_id.take()
-                && let Some(card) = self
-                    .deck_cards
-                    .iter()
-                    .find(|card| card.id == deck_id)
-                    .cloned()
-            {
-                self.delete_deck(card.id, &card.name);
+            if let Some(deck_id) = self.dragging_deck_id.take() {
+                let deck_ids = self.deck_drag_ids(deck_id);
+                self.delete_decks(&deck_ids);
             }
             if let Some(group_id) = self.dragging_group_id.take()
                 && let Some(group) = self
@@ -2128,12 +3518,32 @@ impl ShuaForgeApp {
             ui.small("暂无题组。创建题组后，可将多个题库合并练习。");
         } else {
             let groups = self.group_cards.clone();
-            let columns = grid_columns(ui, CARD_WIDTH);
-            egui::Grid::new("group_bookshelf_grid")
-                .num_columns(columns)
-                .spacing(egui::vec2(12.0, 12.0))
-                .show(ui, |ui| {
-                    for (index, group) in groups.into_iter().enumerate() {
+            let columns = if self.ui_mode == AppUiMode::Mobile {
+                mobile_library_card_columns(ui, groups.len())
+            } else if compact_cards {
+                1
+            } else {
+                grid_columns(ui, CARD_WIDTH)
+            };
+            let gap = if self.ui_mode == AppUiMode::Mobile {
+                MOBILE_LIBRARY_CARD_GAP
+            } else {
+                12.0
+            };
+            let mobile_cell_width = if self.ui_mode == AppUiMode::Mobile {
+                Some(
+                    ((ui.available_width() - gap * (columns.saturating_sub(1) as f32))
+                        / columns as f32)
+                        .max(MOBILE_LIBRARY_CARD_MIN_WIDTH),
+                )
+            } else {
+                None
+            };
+            for row in groups.chunks(columns) {
+                ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = gap;
+                    for group in row {
+                        let group = group.clone();
                         let group_decks = self
                             .store
                             .as_ref()
@@ -2145,14 +3555,33 @@ impl ShuaForgeApp {
                             start_clicked,
                             analyze_clicked,
                             diagnose_clicked,
+                            export_clicked,
                             remove_requests,
-                        ) = render_group_card(
-                            ui,
-                            &group,
-                            &group_decks,
-                            self.dragging_deck_id.is_some(),
-                            self.dragging_group_id == Some(group.id),
-                        );
+                        ) = if self.ui_mode == AppUiMode::Mobile {
+                            let cell_width = mobile_cell_width.unwrap_or(ui.available_width());
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(cell_width, 0.0),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| {
+                                    render_mobile_group_card(
+                                        ui,
+                                        &group,
+                                        &group_decks,
+                                        self.dragging_deck_id.is_some(),
+                                        self.dragging_group_id == Some(group.id),
+                                    )
+                                },
+                            )
+                            .inner
+                        } else {
+                            render_group_card(
+                                ui,
+                                &group,
+                                &group_decks,
+                                self.dragging_deck_id.is_some(),
+                                self.dragging_group_id == Some(group.id),
+                            )
+                        };
                         if drag_response.drag_started() || drag_response.dragged() {
                             self.dragging_group_id = Some(group.id);
                         }
@@ -2165,10 +3594,17 @@ impl ShuaForgeApp {
                         if diagnose_clicked {
                             self.analyze_group_learning_gaps(group.id, group.name.clone());
                         }
+                        if export_clicked {
+                            self.export_group_card(group.id, group.name.clone());
+                        }
                         for deck_id in remove_requests {
                             self.remove_deck_from_group(deck_id, group.id, &group.name);
                         }
                         response.context_menu(|ui| {
+                            if ui.button("导出题组").clicked() {
+                                self.export_group_card(group.id, group.name.clone());
+                                ui.close();
+                            }
                             if ui.button("分析题组题目").clicked() {
                                 self.analyze_group_problems(group.id, group.name.clone());
                                 ui.close();
@@ -2210,83 +3646,340 @@ impl ShuaForgeApp {
                             && response.hovered()
                             && ui.input(|input| input.pointer.any_released())
                         {
-                            self.add_deck_to_group(deck_id, group.id, &group.name);
-                        }
-                        if (index + 1) % columns == 0 {
-                            ui.end_row();
+                            let deck_ids = self.deck_drag_ids(deck_id);
+                            self.add_decks_to_group(&deck_ids, group.id, &group.name);
                         }
                     }
                 });
+                ui.add_space(12.0);
+            }
         }
 
         ui.separator();
-        ui.heading("题库");
+        self.render_library_deck_section(ui, compact_cards);
+
+        if ui.input(|input| input.pointer.any_released()) {
+            self.dragging_deck_id = None;
+            self.dragging_group_id = None;
+        }
+    }
+
+    fn render_library_deck_section(&mut self, ui: &mut egui::Ui, compact_cards: bool) {
+        ui.horizontal_wrapped(|ui| {
+            ui.heading("题库");
+            if !self.deck_cards.is_empty() {
+                ui.small(format!("{} 个题库", self.deck_cards.len()));
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let list_selected = self.library_deck_view == LibraryDeckViewMode::List;
+                let cards_selected = self.library_deck_view == LibraryDeckViewMode::Cards;
+                if ui.selectable_label(list_selected, "☰ 列表").clicked() {
+                    self.library_deck_view = LibraryDeckViewMode::List;
+                    self.persist_settings();
+                }
+                if ui.selectable_label(cards_selected, "▦ 小图标").clicked() {
+                    self.library_deck_view = LibraryDeckViewMode::Cards;
+                    self.persist_settings();
+                }
+            });
+        });
+
         if self.deck_cards.is_empty() {
             ui.vertical_centered(|ui| {
                 ui.add_space(60.0);
                 ui.heading("暂无题库");
                 ui.label("导入题库后，可在此开始练习、分析题目或查看学习诊断。");
             });
-        } else {
-            let cards = self.deck_cards.clone();
-            let columns = grid_columns(ui, CARD_WIDTH);
-            egui::Grid::new("deck_bookshelf_grid")
-                .num_columns(columns)
-                .spacing(egui::vec2(12.0, 12.0))
-                .show(ui, |ui| {
-                    for (index, card) in cards.into_iter().enumerate() {
-                        let (
-                            response,
-                            drag_response,
-                            start_clicked,
-                            analyze_clicked,
-                            diagnose_clicked,
-                        ) = render_library_deck_card(
-                            ui,
-                            &card,
-                            self.dragging_deck_id == Some(card.id),
-                        );
-                        if drag_response.drag_started() || drag_response.dragged() {
-                            self.dragging_deck_id = Some(card.id);
-                        }
-                        if start_clicked {
-                            self.start_deck_card(card.id, card.name.clone());
-                        }
-                        if analyze_clicked {
-                            self.analyze_deck_problems(card.id, card.name.clone());
-                        }
-                        if diagnose_clicked {
-                            self.analyze_deck_learning_gaps(card.id, card.name.clone());
-                        }
-                        response.context_menu(|ui| {
-                            if ui.button("分析题库题目").clicked() {
-                                self.analyze_deck_problems(card.id, card.name.clone());
-                                ui.close();
-                            }
-                            if ui.button("分析答题薄弱点").clicked() {
-                                self.analyze_deck_learning_gaps(card.id, card.name.clone());
-                                ui.close();
-                            }
-                            ui.separator();
-                            if ui.button("从所有题组移出").clicked() {
-                                self.remove_deck_from_all_groups(card.id, &card.name);
-                                ui.close();
-                            }
-                        });
-                        if response.hovered() && ui.input(|input| input.pointer.any_released()) {
-                            self.dragging_deck_id = None;
-                        }
-                        if (index + 1) % columns == 0 {
-                            ui.end_row();
-                        }
-                    }
-                });
+            return;
         }
 
-        if ui.input(|input| input.pointer.any_released()) {
-            self.dragging_deck_id = None;
-            self.dragging_group_id = None;
+        match self.library_deck_view {
+            LibraryDeckViewMode::Cards => self.render_library_deck_cards(ui, compact_cards),
+            LibraryDeckViewMode::List => self.render_library_deck_list(ui),
         }
+    }
+
+    fn render_library_deck_cards(&mut self, ui: &mut egui::Ui, compact_cards: bool) {
+        let cards = self.deck_cards.clone();
+        let columns = if self.ui_mode == AppUiMode::Mobile {
+            mobile_library_card_columns(ui, cards.len())
+        } else if compact_cards {
+            1
+        } else {
+            grid_columns(ui, CARD_WIDTH)
+        };
+        let gap = if self.ui_mode == AppUiMode::Mobile {
+            MOBILE_LIBRARY_CARD_GAP
+        } else {
+            12.0
+        };
+        let mobile_cell_width = if self.ui_mode == AppUiMode::Mobile {
+            Some(
+                ((ui.available_width() - gap * (columns.saturating_sub(1) as f32))
+                    / columns as f32)
+                    .max(MOBILE_LIBRARY_CARD_MIN_WIDTH),
+            )
+        } else {
+            None
+        };
+        for row in cards.chunks(columns) {
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                for card in row {
+                    let card = card.clone();
+                    let (
+                        response,
+                        drag_response,
+                        start_clicked,
+                        preview_clicked,
+                        analyze_clicked,
+                        diagnose_clicked,
+                        export_clicked,
+                        selection_changed,
+                    ) = if self.ui_mode == AppUiMode::Mobile {
+                        let cell_width = mobile_cell_width.unwrap_or(ui.available_width());
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(cell_width, 0.0),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                render_mobile_library_deck_card(
+                                    ui,
+                                    &card,
+                                    self.is_deck_dragging(card.id),
+                                    self.selected_deck_ids.contains(&card.id),
+                                )
+                            },
+                        )
+                        .inner
+                    } else {
+                        render_library_deck_card(
+                            ui,
+                            &card,
+                            self.is_deck_dragging(card.id),
+                            self.selected_deck_ids.contains(&card.id),
+                        )
+                    };
+                    if selection_changed {
+                        self.set_deck_selected(card.id, !self.selected_deck_ids.contains(&card.id));
+                    }
+                    if drag_response.drag_started() || drag_response.dragged() {
+                        self.dragging_deck_id = Some(card.id);
+                    }
+                    self.apply_deck_card_actions(
+                        &card,
+                        start_clicked,
+                        preview_clicked,
+                        analyze_clicked,
+                        diagnose_clicked,
+                        export_clicked,
+                    );
+                    self.render_deck_context_menu(&response, &card);
+                    if response.hovered() && ui.input(|input| input.pointer.any_released()) {
+                        self.dragging_deck_id = None;
+                    }
+                }
+            });
+            ui.add_space(12.0);
+        }
+    }
+
+    fn render_library_deck_list(&mut self, ui: &mut egui::Ui) {
+        let cards = self.deck_cards.clone();
+        egui::Frame::group(ui.style())
+            .inner_margin(egui::Margin::same(8))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.strong("题库");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.small("操作");
+                    });
+                });
+                ui.separator();
+                for card in cards {
+                    self.render_library_deck_list_row(ui, card);
+                    ui.separator();
+                }
+            });
+    }
+
+    fn render_library_deck_list_row(&mut self, ui: &mut egui::Ui, card: DeckCard) {
+        let row_height = if self.ui_mode == AppUiMode::Mobile {
+            104.0
+        } else {
+            58.0
+        };
+        let response = ui
+            .allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), row_height),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    if self.ui_mode == AppUiMode::Mobile {
+                        self.render_mobile_deck_list_row_content(ui, &card);
+                    } else {
+                        self.render_desktop_deck_list_row_content(ui, &card);
+                    }
+                },
+            )
+            .response
+            .interact(egui::Sense::click_and_drag());
+        if response.drag_started() || response.dragged() {
+            self.dragging_deck_id = Some(card.id);
+        }
+        self.render_deck_context_menu(&response, &card);
+        if response.hovered() && ui.input(|input| input.pointer.any_released()) {
+            self.dragging_deck_id = None;
+        }
+    }
+
+    fn render_desktop_deck_list_row_content(&mut self, ui: &mut egui::Ui, card: &DeckCard) {
+        const LIST_ACTION_WIDTH: f32 = 230.0;
+        const LIST_ACTION_GAP: f32 = 12.0;
+        const LIST_CHECKBOX_WIDTH: f32 = 24.0;
+        let available = ui.available_width();
+        let action_width = LIST_ACTION_WIDTH.min(available * 0.46);
+        let info_width =
+            (available - LIST_CHECKBOX_WIDTH - action_width - LIST_ACTION_GAP).max(120.0);
+        ui.horizontal(|ui| {
+            ui.allocate_ui_with_layout(
+                egui::vec2(LIST_CHECKBOX_WIDTH, ui.available_height()),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    let mut selected = self.selected_deck_ids.contains(&card.id);
+                    if ui
+                        .checkbox(&mut selected, "")
+                        .on_hover_text("多选题库")
+                        .changed()
+                    {
+                        self.set_deck_selected(card.id, selected);
+                    }
+                },
+            );
+            ui.allocate_ui_with_layout(
+                egui::vec2(info_width, ui.available_height()),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.strong(&card.name);
+                    ui.small(format!(
+                        "{} 道题 · 新增 {} · 更新 {} · {} · {}",
+                        card.problem_count,
+                        card.inserted,
+                        card.updated,
+                        card.updated_at,
+                        compact_middle(&card.source_path, 30)
+                    ));
+                },
+            );
+            ui.add_space(LIST_ACTION_GAP);
+            ui.allocate_ui_with_layout(
+                egui::vec2(action_width, ui.available_height()),
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
+                    let export_clicked = ui.small_button("导出").clicked();
+                    let diagnose_clicked = ui.small_button("诊断").clicked();
+                    let analyze_clicked = ui.small_button("分析").clicked();
+                    let preview_clicked = ui.small_button("预览").clicked();
+                    let start_clicked = ui.small_button("开始").clicked();
+                    self.apply_deck_card_actions(
+                        card,
+                        start_clicked,
+                        preview_clicked,
+                        analyze_clicked,
+                        diagnose_clicked,
+                        export_clicked,
+                    );
+                },
+            );
+        });
+    }
+
+    fn render_mobile_deck_list_row_content(&mut self, ui: &mut egui::Ui, card: &DeckCard) {
+        ui.horizontal(|ui| {
+            let mut selected = self.selected_deck_ids.contains(&card.id);
+            if ui
+                .checkbox(&mut selected, "")
+                .on_hover_text("多选题库")
+                .changed()
+            {
+                self.set_deck_selected(card.id, selected);
+            }
+            ui.strong(&card.name);
+        });
+        ui.small(format!(
+            "{} 道题 · 新增 {} · 更新 {}",
+            card.problem_count, card.inserted, card.updated
+        ));
+        ui.small(format!(
+            "{} · {}",
+            card.updated_at,
+            compact_middle(&card.source_path, 24)
+        ));
+        ui.horizontal_wrapped(|ui| {
+            let start_clicked = ui.small_button("开始").clicked();
+            let preview_clicked = ui.small_button("预览").clicked();
+            let analyze_clicked = ui.small_button("分析").clicked();
+            let diagnose_clicked = ui.small_button("诊断").clicked();
+            let export_clicked = ui.small_button("导出").clicked();
+            self.apply_deck_card_actions(
+                card,
+                start_clicked,
+                preview_clicked,
+                analyze_clicked,
+                diagnose_clicked,
+                export_clicked,
+            );
+        });
+    }
+
+    fn apply_deck_card_actions(
+        &mut self,
+        card: &DeckCard,
+        start_clicked: bool,
+        preview_clicked: bool,
+        analyze_clicked: bool,
+        diagnose_clicked: bool,
+        export_clicked: bool,
+    ) {
+        if start_clicked {
+            self.start_deck_card(card.id, card.name.clone());
+        }
+        if preview_clicked {
+            self.preview_deck_card(card.id, card.name.clone());
+        }
+        if analyze_clicked {
+            self.analyze_deck_problems(card.id, card.name.clone());
+        }
+        if diagnose_clicked {
+            self.analyze_deck_learning_gaps(card.id, card.name.clone());
+        }
+        if export_clicked {
+            self.export_deck_card(card.id, card.name.clone());
+        }
+    }
+
+    fn render_deck_context_menu(&mut self, response: &egui::Response, card: &DeckCard) {
+        response.context_menu(|ui| {
+            if ui.button("导出题库").clicked() {
+                self.export_deck_card(card.id, card.name.clone());
+                ui.close();
+            }
+            if ui.button("分析题库题目").clicked() {
+                self.analyze_deck_problems(card.id, card.name.clone());
+                ui.close();
+            }
+            if ui.button("预览题库").clicked() {
+                self.preview_deck_card(card.id, card.name.clone());
+                ui.close();
+            }
+            if ui.button("分析答题薄弱点").clicked() {
+                self.analyze_deck_learning_gaps(card.id, card.name.clone());
+                ui.close();
+            }
+            ui.separator();
+            if ui.button("从所有题组移出").clicked() {
+                self.remove_deck_from_all_groups(card.id, &card.name);
+                ui.close();
+            }
+        });
     }
 
     fn render_analysis_dialog(&mut self, ctx: &egui::Context) {
@@ -2376,7 +4069,10 @@ impl ShuaForgeApp {
                             }
                             if dialog.kind == AnalysisKind::ProblemSet
                                 && ui
-                                    .add_enabled(!dialog.is_loading, egui::Button::new("AI核查"))
+                                    .add_enabled(
+                                        !dialog.is_loading,
+                                        egui::Button::new("AI总监核查"),
+                                    )
                                     .clicked()
                             {
                                 ai_review_check_requested = true;
@@ -2597,6 +4293,54 @@ impl ShuaForgeApp {
         self.show_about = open && self.show_about;
     }
 
+    fn render_text_import_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_text_import_dialog {
+            return;
+        }
+
+        let mut open = self.show_text_import_dialog;
+        let mut should_import = false;
+        let mut should_clear = false;
+        egui::Window::new("粘贴导入题库")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(420.0)
+            .show(ctx, |ui| {
+                ui.label(
+                    "将 JSON 或 CSV 题库内容粘贴到下方。适合手机端从聊天、文件或浏览器复制后导入。",
+                );
+                ui.add_space(8.0);
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.text_import_buffer)
+                        .hint_text("粘贴题库 JSON / CSV 文本…")
+                        .desired_rows(12)
+                        .desired_width(ui.available_width()),
+                );
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("导入").clicked() {
+                        should_import = true;
+                    }
+                    if ui.button("清空").clicked() {
+                        should_clear = true;
+                    }
+                    if ui.button("取消").clicked() {
+                        self.show_text_import_dialog = false;
+                    }
+                });
+            });
+
+        if should_clear {
+            self.text_import_buffer.clear();
+        }
+        if should_import {
+            self.import_problem_bank_text();
+        } else {
+            self.show_text_import_dialog = open && self.show_text_import_dialog;
+        }
+    }
+
     fn render_update_prompt(&mut self, ctx: &egui::Context) {
         if !self.show_update_prompt {
             return;
@@ -2687,431 +4431,6 @@ impl ShuaForgeApp {
     }
 }
 
-fn render_analysis_input_bar(
-    ui: &mut egui::Ui,
-    dialog: &mut AnalysisDialogState,
-    enter_to_send: &mut bool,
-) -> bool {
-    let mut send_clicked = false;
-    ui.horizontal(|ui| {
-        ui.strong("继续追问");
-        ui.small("Ctrl + Enter 发送");
-    });
-    egui::Frame::new()
-        .fill(ui.visuals().extreme_bg_color)
-        .stroke(egui::Stroke::new(
-            1.0,
-            ui.visuals().widgets.noninteractive.bg_stroke.color,
-        ))
-        .corner_radius(egui::CornerRadius::same(10))
-        .inner_margin(egui::Margin::same(10))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-                let button_width = 64.0;
-                let input_width =
-                    (ui.available_width() - button_width - 8.0).clamp(80.0, ui.available_width());
-                let response = ui.add(
-                    egui::TextEdit::multiline(&mut dialog.input)
-                        .desired_width(input_width)
-                        .desired_rows(2)
-                        .hint_text("追问分析细节、生成复习计划或让 AI 换一种说法…"),
-                );
-                *enter_to_send = response.has_focus()
-                    && ui
-                        .input(|input| input.modifiers.ctrl && input.key_pressed(egui::Key::Enter));
-                let send_label = if dialog.is_loading {
-                    "取消"
-                } else {
-                    "发送"
-                };
-                let send_button =
-                    egui::Button::new(send_label).min_size(egui::vec2(button_width, 42.0));
-                if ui.add_sized([button_width, 42.0], send_button).clicked() {
-                    send_clicked = true;
-                }
-            });
-        });
-    ui.small("AI 会基于上方分析结果继续回答，不会重新导入题库。");
-    send_clicked
-}
-
-fn render_chat_message(ui: &mut egui::Ui, message: &ChatMessage) {
-    let (label, accent, fill) = match message.role {
-        ChatRole::User => (
-            "用户",
-            egui::Color32::from_rgb(120, 170, 255),
-            egui::Color32::from_rgb(38, 68, 118),
-        ),
-        ChatRole::Assistant => (
-            "助手",
-            egui::Color32::from_rgb(150, 210, 160),
-            ui.visuals().faint_bg_color,
-        ),
-        ChatRole::Tool => (
-            "工具调用",
-            egui::Color32::from_rgb(220, 180, 110),
-            egui::Color32::from_rgb(45, 43, 38),
-        ),
-    };
-    let available = ui.available_width().max(1.0);
-    let max_bubble_width = (available * 0.86).clamp(160.0, 820.0).min(available - 16.0);
-    let bubble_width = adaptive_chat_bubble_width(message, max_bubble_width);
-    let layout = if message.role == ChatRole::User {
-        egui::Layout::right_to_left(egui::Align::Min)
-    } else {
-        egui::Layout::left_to_right(egui::Align::Min)
-    };
-    ui.with_layout(layout, |ui| {
-        egui::Frame::new()
-            .fill(fill)
-            .stroke(egui::Stroke::new(1.0, accent.gamma_multiply(0.55)))
-            .corner_radius(egui::CornerRadius::same(12))
-            .inner_margin(egui::Margin::symmetric(12, 10))
-            .show(ui, |ui| {
-                ui.set_min_width(0.0);
-                ui.set_max_width(bubble_width);
-                ui.set_width(bubble_width);
-                ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-                    ui.set_width(bubble_width);
-                    let header = if message.title == label {
-                        label.to_owned()
-                    } else {
-                        format!("{label} · {}", message.title)
-                    };
-                    ui.colored_label(accent, header);
-                    ui.add_space(3.0);
-                    if message.role == ChatRole::Tool {
-                        ui.collapsing("参数", |ui| {
-                            egui::ScrollArea::vertical()
-                                .id_salt(("tool_message", &message.title))
-                                .max_height(120.0)
-                                .show(ui, |ui| {
-                                    ui.monospace(&message.content);
-                                });
-                        });
-                    } else {
-                        ui.set_width((bubble_width - 24.0).max(80.0));
-                        if message.role == ChatRole::Assistant {
-                            render_markdown_text(
-                                ui,
-                                &message.content,
-                                (bubble_width - 24.0).max(80.0),
-                            );
-                        } else {
-                            ui.add(egui::Label::new(&message.content).wrap());
-                        }
-                    }
-                });
-            });
-    });
-}
-
-fn adaptive_chat_bubble_width(message: &ChatMessage, max_width: f32) -> f32 {
-    let header_chars = message.title.chars().count() + 8;
-    let longest_line_chars = message
-        .content
-        .lines()
-        .map(|line| line.chars().count())
-        .max()
-        .unwrap_or(0)
-        .max(header_chars);
-    let visible_chars = message.content.chars().count().max(longest_line_chars);
-    let estimated_char_width = match message.role {
-        ChatRole::Tool => 8.5,
-        ChatRole::User | ChatRole::Assistant => 13.0,
-    };
-    let ideal_width = longest_line_chars as f32 * estimated_char_width + 42.0;
-    let multiline_width = if visible_chars > 120 {
-        max_width
-    } else {
-        ideal_width
-    };
-    multiline_width.clamp(128.0, max_width)
-}
-
-fn render_markdown_text(ui: &mut egui::Ui, text: &str, content_width: f32) {
-    let normalized = normalize_display_symbols(text);
-    let lines = normalized.lines().collect::<Vec<_>>();
-    let mut index = 0;
-    while index < lines.len() {
-        if let Some((table, consumed)) = parse_markdown_table(&lines[index..]) {
-            render_markdown_table(ui, &table, content_width);
-            index += consumed;
-            continue;
-        }
-
-        let raw_line = lines[index];
-        index += 1;
-        let line = raw_line.trim_end();
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            ui.add_space(6.0);
-            continue;
-        }
-        if trimmed == "---" || trimmed == "***" {
-            ui.separator();
-            continue;
-        }
-
-        if let Some(heading) = trimmed.strip_prefix("#### ") {
-            ui.add_space(2.0);
-            ui.label(
-                egui::RichText::new(strip_markdown_inline(heading))
-                    .strong()
-                    .size(16.0),
-            );
-            continue;
-        }
-        if let Some(heading) = trimmed.strip_prefix("### ") {
-            ui.add_space(3.0);
-            ui.label(
-                egui::RichText::new(strip_markdown_inline(heading))
-                    .strong()
-                    .size(18.0),
-            );
-            continue;
-        }
-        if let Some(heading) = trimmed.strip_prefix("## ") {
-            ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new(strip_markdown_inline(heading))
-                    .strong()
-                    .size(20.0),
-            );
-            continue;
-        }
-        if let Some(heading) = trimmed.strip_prefix("# ") {
-            ui.add_space(5.0);
-            ui.label(
-                egui::RichText::new(strip_markdown_inline(heading))
-                    .strong()
-                    .size(22.0),
-            );
-            continue;
-        }
-
-        if let Some(item) = markdown_list_item(trimmed) {
-            ui.horizontal_wrapped(|ui| {
-                ui.label("•");
-                render_inline_markdown(ui, item);
-            });
-            continue;
-        }
-
-        render_inline_markdown(ui, trimmed);
-    }
-}
-
-fn parse_markdown_table(lines: &[&str]) -> Option<(Vec<Vec<String>>, usize)> {
-    if lines.len() < 2 {
-        return None;
-    }
-    let header = parse_table_row(lines[0])?;
-    if header.len() < 2 || !is_table_separator(lines[1], header.len()) {
-        return None;
-    }
-
-    let mut rows = vec![header];
-    let mut consumed = 2;
-    for line in lines.iter().skip(2) {
-        let Some(row) = parse_table_row(line) else {
-            break;
-        };
-        if row.len() < 2 {
-            break;
-        }
-        rows.push(row);
-        consumed += 1;
-    }
-
-    Some((rows, consumed))
-}
-
-fn parse_table_row(line: &str) -> Option<Vec<String>> {
-    let trimmed = line.trim();
-    if !trimmed.contains('|') {
-        return None;
-    }
-    let trimmed = trimmed.trim_matches('|');
-    let cells = trimmed
-        .split('|')
-        .map(|cell| cell.trim().to_owned())
-        .collect::<Vec<_>>();
-    (cells.len() >= 2).then_some(cells)
-}
-
-fn is_table_separator(line: &str, min_columns: usize) -> bool {
-    let Some(cells) = parse_table_row(line) else {
-        return false;
-    };
-    cells.len() >= min_columns
-        && cells.iter().all(|cell| {
-            let cell = cell.trim();
-            !cell.is_empty() && cell.chars().all(|ch| ch == '-' || ch == ':' || ch == ' ')
-        })
-}
-
-fn render_markdown_table(ui: &mut egui::Ui, rows: &[Vec<String>], content_width: f32) {
-    ui.add_space(4.0);
-    egui::Frame::new()
-        .fill(ui.visuals().extreme_bg_color.gamma_multiply(0.55))
-        .stroke(egui::Stroke::new(
-            1.0,
-            ui.visuals().widgets.noninteractive.bg_stroke.color,
-        ))
-        .corner_radius(egui::CornerRadius::same(8))
-        .inner_margin(egui::Margin::same(8))
-        .show(ui, |ui| {
-            ui.set_width(content_width);
-            ui.set_min_width(content_width);
-            egui::ScrollArea::horizontal()
-                .id_salt((
-                    "markdown_table",
-                    rows.len(),
-                    rows.first().map_or(0, Vec::len),
-                ))
-                .max_width(content_width)
-                .show(ui, |ui| {
-                    egui::Grid::new((
-                        "markdown_table_grid",
-                        rows.len(),
-                        rows.first().map_or(0, Vec::len),
-                    ))
-                    .striped(true)
-                    .spacing(egui::vec2(14.0, 6.0))
-                    .show(ui, |ui| {
-                        for (row_index, row) in rows.iter().enumerate() {
-                            for cell in row {
-                                if row_index == 0 {
-                                    ui.label(
-                                        egui::RichText::new(strip_markdown_inline(cell)).strong(),
-                                    );
-                                } else {
-                                    ui.label(strip_markdown_inline(cell));
-                                }
-                            }
-                            ui.end_row();
-                        }
-                    });
-                });
-        });
-}
-fn normalize_display_symbols(text: &str) -> String {
-    text.chars()
-        .map(|ch| match ch {
-            '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2212}' => '-',
-            '\u{00a0}' => ' ',
-            _ => ch,
-        })
-        .collect()
-}
-
-fn markdown_list_item(line: &str) -> Option<&str> {
-    line.strip_prefix("*   ")
-        .or_else(|| line.strip_prefix("* "))
-        .or_else(|| line.strip_prefix("- "))
-        .or_else(|| {
-            let (number, rest) = line.split_once(".  ")?;
-            number.chars().all(|ch| ch.is_ascii_digit()).then_some(rest)
-        })
-        .or_else(|| {
-            let (number, rest) = line.split_once(". ")?;
-            number.chars().all(|ch| ch.is_ascii_digit()).then_some(rest)
-        })
-}
-
-fn render_inline_markdown(ui: &mut egui::Ui, line: &str) {
-    ui.horizontal_wrapped(|ui| {
-        for (index, segment) in line.split("**").enumerate() {
-            if segment.is_empty() {
-                continue;
-            }
-            render_code_segments(ui, segment, index % 2 == 1);
-        }
-    });
-}
-
-fn render_code_segments(ui: &mut egui::Ui, text: &str, strong: bool) {
-    for (index, segment) in text.split('`').enumerate() {
-        if segment.is_empty() {
-            continue;
-        }
-        let mut rich = egui::RichText::new(segment.to_owned());
-        if strong {
-            rich = rich.strong();
-        }
-        if index % 2 == 1 {
-            rich = rich
-                .monospace()
-                .background_color(ui.visuals().extreme_bg_color);
-        }
-        ui.label(rich);
-    }
-}
-
-fn strip_markdown_inline(text: &str) -> String {
-    text.replace("**", "").replace('`', "")
-}
-
-fn format_bytes(bytes: u64) -> String {
-    const UNITS: &[&str] = &["B", "KB", "MB", "GB"];
-    let mut value = bytes as f64;
-    let mut unit_index = 0usize;
-    while value >= 1024.0 && unit_index + 1 < UNITS.len() {
-        value /= 1024.0;
-        unit_index += 1;
-    }
-    if unit_index == 0 {
-        format!("{} {}", bytes, UNITS[unit_index])
-    } else {
-        format!("{value:.1} {}", UNITS[unit_index])
-    }
-}
-
-fn render_update_progress_bar(ui: &mut egui::Ui, downloaded: u64, total: u64) {
-    if total > 0 {
-        let progress = (downloaded as f32 / total as f32).clamp(0.0, 1.0);
-        ui.add(
-            egui::ProgressBar::new(progress)
-                .desired_width(ui.available_width())
-                .text(format!("下载进度 {:.0}%", progress * 100.0)),
-        );
-    } else {
-        ui.add(
-            egui::ProgressBar::new(0.35)
-                .animate(true)
-                .desired_width(ui.available_width())
-                .text("正在下载..."),
-        );
-    }
-}
-
-fn render_analysis_progress_bar(ui: &mut egui::Ui, progress: Option<&AnalysisProgressState>) {
-    let Some(progress) = progress else { return };
-    if progress.total == 0 {
-        ui.add(
-            egui::ProgressBar::new(0.6)
-                .animate(true)
-                .desired_width(ui.available_width())
-                .text(progress.text()),
-        );
-    } else {
-        ui.add(
-            egui::ProgressBar::new(progress.fraction())
-                .desired_width(ui.available_width())
-                .text(progress.text()),
-        );
-    }
-}
-
-fn grid_columns(ui: &egui::Ui, card_width: f32) -> usize {
-    let gap = 12.0;
-    ((ui.available_width() + gap) / (card_width + gap))
-        .floor()
-        .max(1.0) as usize
-}
-
 fn load_persisted_settings(
     store: &AppStore,
 ) -> Result<PersistedSettings, Box<dyn std::error::Error + Send + Sync>> {
@@ -3119,6 +4438,28 @@ fn load_persisted_settings(
         return Ok(PersistedSettings::default());
     };
     Ok(serde_json::from_str(&value)?)
+}
+
+fn compact_middle(value: &str, max_chars: usize) -> String {
+    let count = value.chars().count();
+    if count <= max_chars {
+        return value.to_owned();
+    }
+    if max_chars <= 3 {
+        return "…".to_owned();
+    }
+    let head_len = (max_chars - 1) / 2;
+    let tail_len = max_chars - 1 - head_len;
+    let head: String = value.chars().take(head_len).collect();
+    let tail: String = value
+        .chars()
+        .rev()
+        .take(tail_len)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{head}…{tail}")
 }
 
 fn load_persisted_update_settings(
@@ -3130,10 +4471,134 @@ fn load_persisted_update_settings(
     Ok(serde_json::from_str(&value)?)
 }
 
+fn browser_snapshot_import_meta(
+    snapshot_json: &str,
+    problems: &[Problem],
+) -> BrowserSnapshotImportMeta {
+    let value = serde_json::from_str::<serde_json::Value>(snapshot_json).ok();
+    let bank_name = value
+        .as_ref()
+        .and_then(|value| value.pointer("/bank/name"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            problems
+                .iter()
+                .find_map(|problem| problem.deck_name.as_deref())
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .or_else(|| {
+            value
+                .as_ref()
+                .and_then(|value| value.get("title"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|title| !title.is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| "浏览器页面快照".into());
+    let url = value
+        .as_ref()
+        .and_then(|value| value.get("url"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .unwrap_or_default();
+    let fingerprint_seed = if url.is_empty() {
+        format!("{bank_name}\n{snapshot_json}")
+    } else {
+        format!("{bank_name}\n{url}")
+    };
+    let hash = hex::encode(&Sha256::digest(fingerprint_seed.as_bytes())[..8]);
+    let safe_name = safe_virtual_source_name(&bank_name);
+    BrowserSnapshotImportMeta {
+        source_path: PathBuf::from(format!("browser-snapshot-{safe_name}-{hash}.json")),
+        director_title: format!("浏览器页面快照 · {bank_name}"),
+    }
+}
+
+fn safe_virtual_source_name(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else if ch.is_whitespace()
+                || matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+            {
+                '-'
+            } else {
+                ch
+            }
+        })
+        .collect::<String>();
+    let compact = sanitized
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    let trimmed = compact.trim_matches('-');
+    if trimmed.is_empty() {
+        "browser".into()
+    } else {
+        trimmed.chars().take(48).collect()
+    }
+}
+
+fn import_director_analysis_title(path: &Path, deck_name: Option<&str>) -> Option<String> {
+    let source = path.to_string_lossy();
+    if source == "浏览器页面快照" {
+        return Some("AI总监审查 · 浏览器页面快照".into());
+    }
+    if source.starts_with("browser-snapshot-") {
+        let name = deck_name
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or("浏览器页面快照");
+        return Some(format!("AI总监审查 · 浏览器页面快照 · {name}"));
+    }
+    None
+}
+
+fn mobile_library_card_columns(ui: &egui::Ui, item_count: usize) -> usize {
+    mobile_library_card_columns_for_width(ui.available_width(), item_count)
+}
+
+fn mobile_library_card_columns_for_width(available_width: f32, item_count: usize) -> usize {
+    if item_count == 0 {
+        return 1;
+    }
+    // Return the number of layout slots, not clamped to the item count. This keeps
+    // a sparse final row (or a single card) card-sized instead of stretching it
+    // across the full mobile/Pad width.
+    ((available_width + MOBILE_LIBRARY_CARD_GAP)
+        / (MOBILE_LIBRARY_CARD_TARGET_WIDTH + MOBILE_LIBRARY_CARD_GAP))
+        .floor()
+        .max(2.0) as usize
+}
+
 impl eframe::App for ShuaForgeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.view == AppView::Practice {
+            let tab_pressed = suppress_practice_tab_focus(ctx);
+            if tab_pressed || self.clear_practice_focus_next_frame {
+                clear_egui_keyboard_focus(ctx);
+            }
+            self.clear_practice_focus_next_frame = tab_pressed;
+        } else {
+            self.clear_practice_focus_next_frame = false;
+        }
+
         self.poll_ai();
         self.poll_ai_import();
+        self.poll_browser_snapshot_import();
+        #[cfg(target_os = "android")]
+        self.poll_android_file_picker_import();
+        self.poll_lan_sync();
         self.poll_update();
         if self.is_ai_loading {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
@@ -3148,544 +4613,24 @@ impl eframe::App for ShuaForgeApp {
         if self.is_update_checking || self.is_update_applying {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
+        if self.browser_snapshot_receiver.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
+        if self.sync_receiver.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
         if self.dragging_deck_id.is_some() || self.dragging_group_id.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
         self.render_analysis_dialog(ctx);
+        self.render_deck_preview_dialog(ctx);
         self.render_about_dialog(ctx);
+        self.render_text_import_dialog(ctx);
         self.render_update_prompt(ctx);
 
-        egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.heading("ShuaForge");
-                ui.label("轻量 Rust 刷题助手");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .button(self.theme_button_icon())
-                        .on_hover_text(self.theme_button_tooltip())
-                        .clicked()
-                    {
-                        self.toggle_theme(ctx);
-                    }
-                    if ui.button("关于").clicked() {
-                        self.show_about = true;
-                    }
-                });
-            });
-        });
-
-        if self.view == AppView::Library {
-            egui::SidePanel::right("config_panel")
-                .resizable(true)
-                .default_width(300.0)
-                .show(ctx, |ui| {
-                    egui::ScrollArea::vertical()
-                        .id_salt("config_panel_scroll")
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            ui.heading("练习设置");
-                            let mut shuffled = self.practice_order == PracticeOrder::Shuffled;
-                            if ui.checkbox(&mut shuffled, "乱序练习").changed() {
-                                self.practice_order = if shuffled {
-                                    PracticeOrder::Shuffled
-                                } else {
-                                    PracticeOrder::Sequential
-                                };
-                                self.status = if shuffled {
-                                    "已切换为乱序练习。"
-                                } else {
-                                    "已切换为顺序练习。"
-                                }
-                                .into();
-                                self.persist_settings();
-                            }
-
-                            ui.separator();
-                            ui.heading("AI 配置");
-                            ui.horizontal_wrapped(|ui| {
-                                if ui.button("导入 JSON").clicked() {
-                                    self.load_ai_config();
-                                }
-                                if ui.button("导出 JSON").clicked() {
-                                    self.save_ai_config();
-                                }
-                            });
-                            ui.small(
-                                "配置会自动保存到本机数据库。JSON 导入/导出可用于备份或迁移配置。",
-                            );
-                            let mut settings_changed = false;
-                            settings_changed |= ui
-                                .checkbox(&mut self.ai_config.enabled, "启用 AI 错题解析")
-                                .changed();
-                            ui.label("Endpoint");
-                            settings_changed |= ui
-                                .text_edit_singleline(&mut self.ai_config.endpoint)
-                                .changed();
-                            ui.label("Model");
-                            settings_changed |=
-                                ui.text_edit_singleline(&mut self.ai_config.model).changed();
-                            ui.label("Fast Model（知识点预标注，可填 DeepSeek-v4-flash）");
-                            settings_changed |= ui
-                                .text_edit_singleline(&mut self.ai_config.fast_model)
-                                .changed();
-                            ui.label("API Key（仅保存在本机 SQLite 设置中）");
-                            settings_changed |= ui
-                                .add(
-                                    egui::TextEdit::singleline(&mut self.ai_config.api_key)
-                                        .password(true),
-                                )
-                                .changed();
-                            settings_changed |= ui
-                                .add(
-                                    egui::Slider::new(
-                                        &mut self.ai_config.knowledge_point_concurrency,
-                                        1..=6,
-                                    )
-                                    .text("知识点并发"),
-                                )
-                                .changed();
-                            settings_changed |= ui
-                                .add(
-                                    egui::Slider::new(&mut self.ai_config.timeout_secs, 5..=120)
-                                        .text("超时秒数"),
-                                )
-                                .changed();
-                            if settings_changed {
-                                self.persist_settings();
-                            }
-
-                            ui.separator();
-                            ui.heading("状态");
-                            ui.label(&self.status);
-                            ui.label(format!("全部题目：{} 道", self.bank_count));
-                            ui.label(format!("题库：{} 个", self.deck_cards.len()));
-                            ui.label(format!("题组：{} 个", self.group_cards.len()));
-                            if let Some(name) = &self.active_deck_name {
-                                ui.label(format!("当前题库：{name}"));
-                            }
-
-                            if let Some(path) = &self.loaded_path {
-                                ui.small(format!("题库：{}", path.display()));
-                            }
-                            if let Some(path) = &self.ai_config_path {
-                                ui.small(format!("AI 配置：{}", path.display()));
-                            }
-
-                            ui.separator();
-                            ui.heading("浏览器导出脚本");
-                            if ui.button("安装题库导出油猴脚本").clicked() {
-                                match userscript_server::open_userscript_install_page() {
-                                    Ok(url) => {
-                                        self.status = format!(
-                                            "已在浏览器打开 Tampermonkey 官方脚本安装页：{url}。如果中转页卡住或下载 .js，请把 Tampermonkey 的“网站访问权限”设为“在所有网站上”。"
-                                        );
-                                    }
-                                    Err(err) => {
-                                        self.status = err;
-                                    }
-                                }
-                            }
-                            ui.small(
-                                "会启动本机 127.0.0.1 临时服务，并通过 Tampermonkey 官方安装页读取 .user.js；浏览器扩展仍需要你确认安装。",
-                            );
-
-                            ui.collapsing("答题历史", |ui| {
-                                for record in &self.answer_history {
-                                    ui.small(format!(
-                                        "{} {} {}：{} / {}",
-                                        record.answered_at,
-                                        if record.is_correct { "✅" } else { "❌" },
-                                        record.problem_id,
-                                        record.user_answer,
-                                        record.correct_answer
-                                    ));
-                                }
-                            });
-                        });
-                });
-        }
-
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let mut submit_requested = false;
-            let mut skip_requested = false;
-            let mut solution_guide_requested = false;
-            let mut back_to_library_requested = false;
-
-            if self.view == AppView::Practice {
-                let Some(deck) = &self.deck else {
-                    self.view = AppView::Library;
-                    return;
-                };
-                let stats = deck.stats();
-                ui.horizontal(|ui| {
-                    if ui.button("← 题库主页").clicked() {
-                        back_to_library_requested = true;
-                    }
-                    ui.separator();
-                    ui.label(format!("总题数：{}", stats.total));
-                    ui.label(format!("剩余：{}", stats.remaining));
-                    ui.label(format!("答对：{}", stats.correct));
-                    ui.label(format!("答错：{}", stats.wrong));
-                });
-                let completed = stats.correct + stats.wrong;
-                let progress = if stats.total == 0 {
-                    0.0
-                } else {
-                    completed as f32 / stats.total as f32
-                };
-                ui.add(
-                    egui::ProgressBar::new(progress)
-                        .desired_width(ui.available_width())
-                        .text(format!(
-                            "经验值 Lv.{} · {completed}/{}",
-                            stats.correct / 10 + 1,
-                            stats.total
-                        )),
-                );
-                ui.separator();
-
-                if deck.is_finished() {
-                    ui.heading("本轮练习已完成");
-                    ui.label("本轮练习已完成。可返回题库主页选择新的练习内容。");
-                } else if let Some(problem) = deck.current() {
-                    ui.heading(format!("题目 #{}", problem.id));
-                    ui.small(format!("题型：{}", problem_type_label(problem.kind())));
-                    if !problem.tags.is_empty() {
-                        ui.horizontal_wrapped(|ui| {
-                            for tag in &problem.tags {
-                                ui.label(
-                                    egui::RichText::new(format!("# {tag}"))
-                                        .color(egui::Color32::from_rgb(108, 166, 255)),
-                                );
-                            }
-                        });
-                    }
-                    ui.add_space(8.0);
-                    render_problem(ui, problem);
-
-                    ui.add_space(12.0);
-                    ui.label("你的答案");
-                    let submit_shortcut = render_answer_input(
-                        ui,
-                        problem,
-                        &mut self.answer_input,
-                        &mut self.selected_single,
-                        &mut self.selected_multiple,
-                    );
-
-                    ui.horizontal(|ui| {
-                        if ui.button("提交答案").clicked() || submit_shortcut {
-                            submit_requested = true;
-                        }
-                        if ui.button("AI 引导解题（不看答案）").clicked() {
-                            solution_guide_requested = true;
-                        }
-                        if ui.button("跳过并重新插回题库").clicked() {
-                            skip_requested = true;
-                        }
-                    });
-                }
-            } else {
-                egui::ScrollArea::vertical()
-                    .id_salt("library_home_scroll")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        self.render_library_home(ui);
-                    });
-            }
-
-            if submit_requested {
-                self.submit_answer();
-            }
-            if solution_guide_requested {
-                self.request_solution_guide();
-            }
-            if back_to_library_requested {
-                self.back_to_library();
-            }
-            if skip_requested && let Some(deck) = &mut self.deck {
-                deck.skip();
-                self.clear_answer_inputs();
-                self.guided_problem_id = None;
-                self.persist_current_practice_session();
-                self.status = "已跳过，题目已重新插回题库。".into();
-            }
-
-            ui.separator();
-            ui.heading(if self.is_ai_loading {
-                "解析与分析（生成中...）"
-            } else {
-                "解析与分析"
-            });
-            render_analysis_progress_bar(ui, self.analysis_progress.as_ref());
-            egui::ScrollArea::vertical()
-                .id_salt("wrong_answer_analysis")
-                .max_height(220.0)
-                .show(ui, |ui| {
-                    render_markdown_text(ui, &self.analysis, ui.available_width());
-                });
-        });
-    }
-}
-
-fn render_problem(ui: &mut egui::Ui, problem: &Problem) {
-    egui::ScrollArea::vertical()
-        .id_salt(("problem_prompt", &problem.id))
-        .max_height(180.0)
-        .show(ui, |ui| {
-            let question = problem.question_text();
-            ui.label(if question.is_empty() {
-                &problem.prompt
-            } else {
-                &question
-            });
-        });
-}
-
-fn render_library_deck_card(
-    ui: &mut egui::Ui,
-    card: &DeckCard,
-    dragging: bool,
-) -> (egui::Response, egui::Response, bool, bool, bool) {
-    let frame = egui::Frame::group(ui.style())
-        .fill(if dragging {
-            egui::Color32::from_rgb(48, 69, 120)
-        } else {
-            ui.visuals().extreme_bg_color
-        })
-        .stroke(if dragging {
-            egui::Stroke::new(2.0, egui::Color32::from_rgb(120, 170, 255))
-        } else {
-            egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color)
-        })
-        .inner_margin(egui::Margin::same(14));
-    let mut start_clicked = false;
-    let mut analyze_clicked = false;
-    let mut diagnose_clicked = false;
-    let mut drag_response: Option<egui::Response> = None;
-    let response = frame
-        .show(ui, |ui| {
-            ui.set_min_size(egui::vec2(CARD_WIDTH, DECK_CARD_HEIGHT));
-            ui.set_max_width(CARD_WIDTH);
-            ui.vertical_centered(|ui| {
-                let info_response = ui
-                    .vertical_centered(|ui| {
-                        ui.heading("📘");
-                        ui.strong(&card.name);
-                        ui.small(format!("{} 道题", card.problem_count));
-                        ui.small(format!("新增 {} · 更新 {}", card.inserted, card.updated));
-                        ui.small(format!("更新时间：{}", card.updated_at));
-                        ui.small(format!("来源：{}", compact_text(&card.source_path, 26)));
-                        ui.small("拖动此区域可移动或删除题库");
-                    })
-                    .response
-                    .interact(egui::Sense::click_and_drag());
-                drag_response = Some(if dragging || info_response.dragged() {
-                    info_response.on_hover_cursor(egui::CursorIcon::Grabbing)
-                } else {
-                    info_response
-                });
-                (start_clicked, analyze_clicked, diagnose_clicked) = render_card_actions(ui);
-            });
-        })
-        .response;
-    let drag_response = drag_response.unwrap_or_else(|| response.clone());
-    (
-        response,
-        drag_response,
-        start_clicked,
-        analyze_clicked,
-        diagnose_clicked,
-    )
-}
-
-fn render_group_card(
-    ui: &mut egui::Ui,
-    group: &GroupCard,
-    group_decks: &[crate::store::GroupDeckCard],
-    hot: bool,
-    dragging: bool,
-) -> (egui::Response, egui::Response, bool, bool, bool, Vec<i64>) {
-    let frame = egui::Frame::group(ui.style())
-        .fill(if hot {
-            egui::Color32::from_rgb(48, 86, 68)
-        } else {
-            ui.visuals().faint_bg_color
-        })
-        .inner_margin(egui::Margin::same(14));
-    let mut start_clicked = false;
-    let mut analyze_clicked = false;
-    let mut diagnose_clicked = false;
-    let mut remove_requests = Vec::new();
-    let mut drag_response: Option<egui::Response> = None;
-    let response = frame
-        .show(ui, |ui| {
-            ui.set_min_size(egui::vec2(CARD_WIDTH, GROUP_CARD_HEIGHT));
-            ui.set_max_width(CARD_WIDTH);
-            ui.vertical_centered(|ui| {
-                let info_response = ui
-                    .vertical_centered(|ui| {
-                        ui.heading("📁");
-                        ui.strong(&group.name);
-                        ui.small(format!(
-                            "{} 个题库 · {} 道题",
-                            group.deck_count, group.problem_count
-                        ));
-                        ui.small(format!("更新时间：{}", group.updated_at));
-                        ui.small("拖动此区域可删除题组");
-                    })
-                    .response
-                    .interact(egui::Sense::click_and_drag());
-                drag_response = Some(if dragging || info_response.dragged() {
-                    info_response.on_hover_cursor(egui::CursorIcon::Grabbing)
-                } else {
-                    info_response
-                });
-                (start_clicked, analyze_clicked, diagnose_clicked) = render_card_actions(ui);
-
-                ui.add_space(4.0);
-                ui.separator();
-                ui.add_space(4.0);
-                ui.small("题组内题库");
-                if group_decks.is_empty() {
-                    ui.small("暂无题库，可从题库卡片拖入这里。");
-                } else {
-                    egui::ScrollArea::vertical()
-                        .max_height(110.0)
-                        .id_salt(("group_decks", group.id))
-                        .show(ui, |ui| {
-                            for deck in group_decks {
-                                ui.horizontal(|ui| {
-                                    ui.small(format!("{}（{}题）", deck.name, deck.problem_count));
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            if ui.small_button("移出").clicked() {
-                                                remove_requests.push(deck.id);
-                                            }
-                                        },
-                                    );
-                                });
-                            }
-                        });
-                }
-            });
-        })
-        .response;
-    let drag_response = drag_response.unwrap_or_else(|| response.clone());
-    (
-        response,
-        drag_response,
-        start_clicked,
-        analyze_clicked,
-        diagnose_clicked,
-        remove_requests,
-    )
-}
-
-fn render_card_actions(ui: &mut egui::Ui) -> (bool, bool, bool) {
-    let spacing = 6.0;
-    let total_width = CARD_BUTTON_WIDTH * 3.0 + spacing * 2.0;
-    let left_padding = ((ui.available_width() - total_width) / 2.0).max(0.0);
-    let mut start_clicked = false;
-    let mut analyze_clicked = false;
-    let mut diagnose_clicked = false;
-
-    ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        ui.add_space(left_padding);
-        ui.spacing_mut().item_spacing.x = spacing;
-        start_clicked = ui
-            .add_sized([CARD_BUTTON_WIDTH, 24.0], egui::Button::new("开始答题"))
-            .clicked();
-        analyze_clicked = ui
-            .add_sized([CARD_BUTTON_WIDTH, 24.0], egui::Button::new("分析题目"))
-            .clicked();
-        diagnose_clicked = ui
-            .add_sized([CARD_BUTTON_WIDTH, 24.0], egui::Button::new("学习诊断"))
-            .clicked();
-    });
-
-    (start_clicked, analyze_clicked, diagnose_clicked)
-}
-
-fn render_trash_zone(ui: &mut egui::Ui, active: bool) -> egui::Response {
-    let frame = egui::Frame::group(ui.style())
-        .fill(if active {
-            egui::Color32::from_rgb(92, 36, 36)
-        } else {
-            ui.visuals().faint_bg_color
-        })
-        .inner_margin(egui::Margin::same(12));
-    frame
-        .show(ui, |ui| {
-            ui.set_min_size(egui::vec2(ui.available_width(), 72.0));
-            ui.vertical_centered(|ui| {
-                ui.heading("🗑 删除区");
-                ui.label("将题库或题组拖到此处删除");
-            });
-        })
-        .response
-        .interact(egui::Sense::click())
-}
-
-fn compact_text(value: &str, max_chars: usize) -> String {
-    if value.chars().count() <= max_chars {
-        return value.to_owned();
-    }
-    let tail: String = value
-        .chars()
-        .rev()
-        .take(max_chars.saturating_sub(1))
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    format!("…{tail}")
-}
-
-fn render_answer_input(
-    ui: &mut egui::Ui,
-    problem: &Problem,
-    answer_input: &mut String,
-    selected_single: &mut Option<String>,
-    selected_multiple: &mut BTreeSet<String>,
-) -> bool {
-    match problem.kind() {
-        ProblemType::SingleChoice => {
-            for option in problem.options() {
-                ui.radio_value(
-                    selected_single,
-                    Some(option.key.clone()),
-                    format!("{}. {}", option.key, option.text),
-                );
-            }
-            false
-        }
-        ProblemType::MultipleChoice => {
-            for option in problem.options() {
-                let mut checked = selected_multiple.contains(&option.key);
-                if ui
-                    .checkbox(&mut checked, format!("{}. {}", option.key, option.text))
-                    .changed()
-                {
-                    if checked {
-                        selected_multiple.insert(option.key.clone());
-                    } else {
-                        selected_multiple.remove(&option.key);
-                    }
-                }
-            }
-            false
-        }
-        ProblemType::Text => {
-            let response = ui.add(
-                egui::TextEdit::multiline(answer_input)
-                    .desired_rows(4)
-                    .hint_text("写下答案后按 Ctrl+Enter 或点击提交"),
-            );
-            response.has_focus()
-                && ui.input(|input| input.modifiers.ctrl && input.key_pressed(egui::Key::Enter))
+        match self.ui_mode {
+            AppUiMode::Desktop => self.render_desktop_ui(ctx),
+            AppUiMode::Mobile => self.render_mobile_ui(ctx),
         }
     }
 }
@@ -3698,69 +4643,97 @@ fn problem_type_label(problem_type: ProblemType) -> &'static str {
     }
 }
 
-fn configure_fonts(ctx: &egui::Context) {
-    let mut fonts = FontDefinitions::default();
+fn problem_display_type_label(problem: &Problem) -> &'static str {
+    if problem.is_judgement() {
+        "判断题"
+    } else {
+        problem_type_label(problem.kind())
+    }
+}
 
-    for (index, (name, data)) in load_system_fonts().into_iter().enumerate() {
-        fonts.font_data.insert(name.clone(), data.into());
+fn ai_review_action_summary(problems: &[Problem]) -> String {
+    let mut accepted = 0usize;
+    let mut pending = 0usize;
+    let mut conflict = 0usize;
+    for problem in problems {
+        if problem.state.answer_source == ProblemAnswerSource::AiReviewed
+            && problem.state.review_status == crate::problem::ProblemReviewStatus::Accepted
+        {
+            accepted += 1;
+        }
+        if problem.needs_ai_review() {
+            pending += 1;
+        }
+        if problem.state.review_status == crate::problem::ProblemReviewStatus::Conflict {
+            conflict += 1;
+        }
+    }
+    format!("自动采纳 {accepted}，仍待确认 {pending}，冲突 {conflict}")
+}
 
-        if index == 0 {
-            fonts
-                .families
-                .entry(FontFamily::Proportional)
-                .or_default()
-                .insert(0, name.clone());
-            fonts
-                .families
-                .entry(FontFamily::Monospace)
-                .or_default()
-                .insert(0, name);
-        } else {
-            fonts
-                .families
-                .entry(FontFamily::Proportional)
-                .or_default()
-                .push(name.clone());
-            fonts
-                .families
-                .entry(FontFamily::Monospace)
-                .or_default()
-                .push(name);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::problem::ProblemState;
+
+    fn test_problem(id: &str, deck_name: &str) -> Problem {
+        Problem {
+            id: id.into(),
+            prompt: format!("题目 {id}"),
+            answer: "A".into(),
+            explanation: String::new(),
+            tags: vec![],
+            problem_type: Some(ProblemType::SingleChoice),
+            deck_name: Some(deck_name.into()),
+            deck_info: None,
+            images: vec![],
+            state: ProblemState::default(),
         }
     }
 
-    ctx.set_fonts(fonts);
+    #[test]
+    fn browser_snapshot_source_path_is_stable_and_distinguishes_decks() {
+        let first_snapshot = r#"{
+            "url": "https://example.test/homework/1",
+            "title": "作业详情",
+            "bank": { "name": "第一章", "info": "" }
+        }"#;
+        let second_snapshot = r#"{
+            "url": "https://example.test/homework/2",
+            "title": "作业详情",
+            "bank": { "name": "第二章", "info": "" }
+        }"#;
 
-    let mut style = (*ctx.style()).clone();
-    style.text_styles = [
-        (egui::TextStyle::Heading, egui::FontId::proportional(26.0)),
-        (egui::TextStyle::Body, egui::FontId::proportional(16.0)),
-        (egui::TextStyle::Button, egui::FontId::proportional(15.0)),
-        (egui::TextStyle::Small, egui::FontId::proportional(13.0)),
-        (egui::TextStyle::Monospace, egui::FontId::monospace(14.0)),
-    ]
-    .into();
-    ctx.set_style(style);
-}
+        let first = browser_snapshot_import_meta(first_snapshot, &[test_problem("p1", "第一章")]);
+        let first_again =
+            browser_snapshot_import_meta(first_snapshot, &[test_problem("p1", "第一章")]);
+        let second = browser_snapshot_import_meta(second_snapshot, &[test_problem("p2", "第二章")]);
 
-fn load_system_fonts() -> Vec<(String, FontData)> {
-    let candidates = [
-        ("Microsoft YaHei", r"C:\Windows\Fonts\msyh.ttc"),
-        ("Microsoft YaHei UI", r"C:\Windows\Fonts\msyh.ttf"),
-        ("Segoe UI Symbol", r"C:\Windows\Fonts\seguisym.ttf"),
-        ("Segoe UI Emoji", r"C:\Windows\Fonts\seguiemj.ttf"),
-        ("Arial Unicode MS", r"C:\Windows\Fonts\arialuni.ttf"),
-        ("SimHei", r"C:\Windows\Fonts\simhei.ttf"),
-        ("SimSun", r"C:\Windows\Fonts\simsun.ttc"),
-        ("Noto Sans CJK", r"C:\Windows\Fonts\NotoSansCJK-Regular.ttc"),
-    ];
+        assert_eq!(first.source_path, first_again.source_path);
+        assert_ne!(first.source_path, second.source_path);
+        assert_eq!(first.director_title, "浏览器页面快照 · 第一章");
+        assert_eq!(second.director_title, "浏览器页面快照 · 第二章");
+    }
 
-    candidates
-        .iter()
-        .filter_map(|(name, path)| {
-            std::fs::read(path)
-                .ok()
-                .map(|bytes| ((*name).to_owned(), FontData::from_owned(bytes)))
-        })
-        .collect()
+    #[test]
+    fn mobile_library_card_columns_are_adaptive_with_two_column_minimum() {
+        assert_eq!(mobile_library_card_columns_for_width(320.0, 1), 2);
+        assert_eq!(mobile_library_card_columns_for_width(320.0, 8), 2);
+        assert_eq!(mobile_library_card_columns_for_width(760.0, 8), 3);
+        assert_eq!(mobile_library_card_columns_for_width(1200.0, 3), 5);
+    }
+
+    #[test]
+    fn browser_snapshot_import_title_uses_deck_name_for_new_virtual_sources() {
+        let path = PathBuf::from("browser-snapshot-第一章-abcdef.json");
+
+        assert_eq!(
+            import_director_analysis_title(&path, Some("第一章")).as_deref(),
+            Some("AI总监审查 · 浏览器页面快照 · 第一章")
+        );
+        assert_eq!(
+            import_director_analysis_title(&PathBuf::from("浏览器页面快照"), None).as_deref(),
+            Some("AI总监审查 · 浏览器页面快照")
+        );
+    }
 }

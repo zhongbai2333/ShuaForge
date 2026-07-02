@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         ShuaForge 题库导出器
+// @name         ShuaForge 题库采集代理
 // @namespace    https://github.com/ShuaForge
-// @version      0.1.0
-// @description  从已完成答题/考试结果页提取题目、正确答案、答案解析，并导出为 ShuaForge 可导入的 CSV。只读导出，不自动答题。
+// @version      0.1.9
+// @description  ShuaForge 浏览器侧题库采集代理：由本机 Rust 程序请求页面快照并接管导入流程。只读采集，不自动答题。
 // @author       ShuaForge
 // @match        *://*.zhihuishu.com/*
 // @match        *://*.chaoxing.com/*
@@ -60,6 +60,12 @@ interface ZipArchive {
     explanation: string;
     tags: string[];
     images: ProblemImage[];
+    answer_source: 'standard' | 'user_temporary' | 'score_inferred' | 'ai_reviewed';
+    review_needed: boolean;
+    review_status: 'none' | 'pending' | 'accepted' | 'unknown' | 'conflict';
+    review_verdict: 'unknown' | 'correct' | 'wrong';
+    review_confidence: 'unknown' | 'high' | 'medium' | 'low';
+    score_display: string;
   }
 
   interface ProblemImage {
@@ -95,8 +101,74 @@ interface ZipArchive {
     promptLine: string;
     options: string[];
     answer: string;
+    correctAnswer: string;
+    userAnswer: string;
     fullText: string;
     answerScore: AnswerScore | null;
+    block: QuestionBlock;
+    blockIndex: number;
+    evidence: ExtractionEvidence;
+    warnings: string[];
+    confidence: number;
+  }
+
+  interface ExtractionEvidence {
+    block_source: string;
+    prompt_source: string;
+    options_source: string;
+    correct_answer_source: string;
+    answer_source: string;
+    score_source: string;
+    explanation_source: string;
+    tags_source: string;
+  }
+
+  interface DebugSnapshot {
+    schema_version: 1;
+    exporter_version: string;
+    captured_at: string;
+    url: string;
+    title: string;
+    selected_root: string;
+    bank: BankInfo;
+    root_text_excerpt: string;
+    block_count: number;
+    problem_count: number;
+    image_count: number;
+    problems: DebugProblemSnapshot[];
+  }
+
+  interface DebugProblemSnapshot {
+    index: number;
+    id: string;
+    block: DebugBlockInfo;
+    raw_text: string;
+    extracted: {
+      prompt: string;
+      options: string[];
+      answer: string;
+      correct_answer: string;
+      score_display: string;
+      explanation: string;
+      tags: string[];
+      images: ProblemImage[];
+      answer_source: Problem['answer_source'];
+      review_needed: boolean;
+      review_status: Problem['review_status'];
+      review_verdict: Problem['review_verdict'];
+    };
+    evidence: ExtractionEvidence;
+    confidence: number;
+    warnings: string[];
+  }
+
+  interface DebugBlockInfo {
+    kind: 'element' | 'virtual';
+    tag: string;
+    id: string;
+    class_name: string;
+    descriptor: string;
+    text_length: number;
   }
 
   interface VirtualQuestionBlock {
@@ -120,9 +192,12 @@ interface ZipArchive {
   const JSZIP_CDN = 'https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js';
   const PENDING_REVIEW_NOTE = '未批改：页面没有提供正确答案，已使用“我的答案”作为临时答案。';
   const SCORE_INFERRED_NOTE = '页面没有提供标准答案，已使用“我的答案”作为导出答案；本题得分可用于判断该作答是否正确。';
+  const BRIDGE_BASE_URL = '__SHUAFORGE_BRIDGE_BASE_URL__';
+  const CLIENT_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
   let selectedRoot: HTMLElement = document.body;
   let selecting = false;
   let lastProblems: Problem[] = [];
+  let bridgePollingStarted = false;
 
   const QUESTION_ROOT_SELECTORS = [
     // 超星/学习通结果页：每道题是 questionLi，答案与得分在 mark_answer 内。
@@ -226,7 +301,7 @@ interface ZipArchive {
     #${PANEL_ID} * { box-sizing: border-box; }
     #${PANEL_ID} .sf-title { display: flex; align-items: center; justify-content: space-between; font-weight: 700; margin-bottom: 8px; }
     #${PANEL_ID} .sf-subtitle { color: #667085; font-size: 12px; margin-bottom: 10px; }
-    #${PANEL_ID} .sf-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 10px; }
+    #${PANEL_ID} .sf-actions { display: grid; grid-template-columns: 1fr; gap: 8px; margin-bottom: 10px; }
     #${PANEL_ID} button {
       cursor: pointer;
       border: 1px solid rgba(90, 129, 255, 0.35);
@@ -262,18 +337,15 @@ interface ZipArchive {
     panel.id = PANEL_ID;
     panel.innerHTML = `
       <div class="sf-title">
-        <span>ShuaForge 题库导出</span>
+        <span>ShuaForge 题库采集</span>
         <button type="button" data-action="hide" title="隐藏面板">×</button>
       </div>
-      <div class="sf-subtitle">用于已完成答题结果页：提取题目、正确答案、解析；有图片时自动导出 ZIP。</div>
+      <div class="sf-subtitle">页面打开后会自动加入 ShuaForge 采集队列，可同时打开多个题库页。</div>
       <div class="sf-actions">
-        <button type="button" data-action="select">选择区域</button>
-        <button type="button" data-action="scan">扫描预览</button>
-        <button type="button" data-action="download" class="sf-primary">导出题库</button>
-        <button type="button" data-action="reset">重置区域</button>
+        <button type="button" data-action="test" class="sf-primary">检查连接状态</button>
       </div>
-      <div class="sf-log" data-role="log">默认扫描整个页面。建议在成绩/解析页点击“选择区域”，框住题目列表外层后再导出。</div>
-      <div class="sf-mini">只读脚本：不会提交答案、不会修改页面数据。</div>
+      <div class="sf-log" data-role="log">正在自动连接 ShuaForge；连接成功后，回到 ShuaForge 点击“从浏览器获取题库”即可采集已连接页面。</div>
+      <div class="sf-mini">只读采集代理：不会提交答案、不会修改页面数据。</div>
     `;
 
     panel.addEventListener('click', (event) => {
@@ -282,16 +354,11 @@ interface ZipArchive {
       if (!button) return;
       const action = button.dataset.action;
       if (action === 'hide') panel.remove();
-      if (action === 'select') startSelecting();
-      if (action === 'scan') scanAndPreview();
-      if (action === 'download') void downloadCsv();
-      if (action === 'reset') {
-        selectedRoot = document.body;
-        log('已重置为扫描整个页面。');
-      }
+      if (action === 'test') void testBridgeConnection();
     });
 
     document.body.appendChild(panel);
+    startBridgePolling();
   }
 
   function log(message: string): void {
@@ -475,6 +542,10 @@ interface ZipArchive {
   }
 
   function extractProblems(root: HTMLElement): Problem[] {
+    return extractProblemDrafts(root).map((draft) => draft.problem);
+  }
+
+  function extractProblemDrafts(root: HTMLElement): ParsedProblemDraft[] {
     const scope = root || document.body;
     const blocks = findQuestionBlocks(scope);
     const indexedScores = extractIndexedAnswerScores(scope);
@@ -492,7 +563,159 @@ interface ZipArchive {
     }
 
     applySingleChoiceScoreFallback(drafts, extractBankInfo(scope));
-    return drafts.map((draft) => draft.problem);
+    refreshDraftDiagnostics(drafts);
+    return drafts;
+  }
+
+  function downloadDebugSnapshot(): void {
+    const scope = selectedRoot || document.body;
+    const snapshot = buildDebugSnapshot(scope);
+    const blob = new Blob([JSON.stringify(snapshot, null, 2)], { type: 'application/json;charset=utf-8' });
+    triggerDownload(blob, `${safeFileName(snapshot.bank.name)}-debug-${timestamp()}.json`);
+    log(`已导出调试快照：题目 ${snapshot.problem_count} 道，候选题块 ${snapshot.block_count} 个。`);
+  }
+
+  async function sendSnapshotToShuaForge(selector?: string): Promise<void> {
+    const scope = selector ? document.querySelector<HTMLElement>(selector) || document.body : document.body;
+    const snapshot = await buildHydratedDebugSnapshot(scope);
+    const endpoint = `${BRIDGE_BASE_URL}/bridge/snapshot?client_id=${encodeURIComponent(CLIENT_ID)}`;
+    try {
+      await postJson(endpoint, snapshot);
+      log(`已发送到 ShuaForge：题目 ${snapshot.problem_count} 道，图片 ${snapshot.image_count} 张，候选题块 ${snapshot.block_count} 个。`);
+    } catch (error) {
+      console.error('[ShuaForge] 快照发送失败：', error);
+      log(`发送失败：请确认 ShuaForge 正在运行；采集服务会随程序自动启动。${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  function startBridgePolling(): void {
+    if (bridgePollingStarted) return;
+    if (!/^https?:\/\/127\.0\.0\.1:\d+/.test(BRIDGE_BASE_URL)) {
+      log('脚本未绑定 ShuaForge 本地服务：请从 ShuaForge 设置页执行一次“安装/更新浏览器脚本”。');
+      return;
+    }
+    bridgePollingStarted = true;
+    void testBridgeConnection(false);
+    window.setInterval(() => void pollBridgeCommand(), 1500);
+    void pollBridgeCommand();
+  }
+
+  async function pollBridgeCommand(): Promise<void> {
+    try {
+      const response = await fetch(`${BRIDGE_BASE_URL}/bridge/poll?client_id=${encodeURIComponent(CLIENT_ID)}`, { method: 'GET', cache: 'no-store' });
+      if (!response.ok) return;
+      const command = await response.json() as { command?: string; selector?: string | null };
+      if (command.command === 'snapshot') {
+        await sendSnapshotToShuaForge(command.selector || undefined);
+      }
+    } catch {
+      // ShuaForge 未运行或服务端口已变更时保持安静，避免打扰页面使用。
+    }
+  }
+
+  async function testBridgeConnection(manual = true): Promise<void> {
+    if (!/^https?:\/\/127\.0\.0\.1:\d+/.test(BRIDGE_BASE_URL)) {
+      log('连接失败：脚本没有绑定本地 ShuaForge 服务。请从 ShuaForge 设置页执行一次“安装/更新浏览器脚本”。');
+      return;
+    }
+    try {
+      const response = await fetch(`${BRIDGE_BASE_URL}/bridge/ping?client_id=${encodeURIComponent(CLIENT_ID)}`, { method: 'GET', cache: 'no-store' });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      log(manual
+        ? '连接正常：当前页面已加入 ShuaForge 采集队列；需要导入时回到 ShuaForge 点击“从浏览器获取题库”。'
+        : '已自动连接 ShuaForge：当前页面会参与下一次浏览器题库采集。');
+    } catch (error) {
+      log(`连接失败：请确认 ShuaForge 正在运行；采集服务会随程序自动启动。${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  async function postJson(url: string, payload: unknown): Promise<void> {
+    const body = JSON.stringify(payload);
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json;charset=utf-8' },
+      body,
+      cache: 'no-store'
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  }
+
+  function buildDebugSnapshot(root: HTMLElement): DebugSnapshot {
+    const scope = root || document.body;
+    const blocks = findQuestionBlocks(scope);
+    const drafts = extractProblemDrafts(scope);
+    const bank = extractBankInfo(scope);
+    const rootText = textSnapshot(scope).text;
+    return {
+      schema_version: 1,
+      exporter_version: '0.1.9',
+      captured_at: new Date().toISOString(),
+      url: location.href,
+      title: document.title,
+      selected_root: describeElement(scope),
+      bank,
+      root_text_excerpt: truncate(rootText, 4000),
+      block_count: blocks.length,
+      problem_count: drafts.length,
+      image_count: countImages(drafts.map((draft) => draft.problem)),
+      problems: drafts.map((draft, index) => buildDebugProblemSnapshot(draft, index + 1))
+    };
+  }
+
+  async function buildHydratedDebugSnapshot(root: HTMLElement): Promise<DebugSnapshot> {
+    const snapshot = buildDebugSnapshot(root);
+    const hydratedProblems = await hydrateProblemImages(snapshot.problems.map((item) => ({
+      id: item.id,
+      prompt: item.extracted.prompt,
+      answer: item.extracted.answer,
+      explanation: item.extracted.explanation,
+      tags: item.extracted.tags,
+      images: item.extracted.images,
+      answer_source: item.extracted.answer_source,
+      review_needed: item.extracted.review_needed,
+      review_status: item.extracted.review_status,
+      review_verdict: item.extracted.review_verdict,
+      review_confidence: 'unknown',
+      score_display: item.extracted.score_display
+    })));
+
+    return {
+      ...snapshot,
+      image_count: countImages(hydratedProblems),
+      problems: snapshot.problems.map((item, index) => ({
+        ...item,
+        extracted: {
+          ...item.extracted,
+          images: hydratedProblems[index]?.images || item.extracted.images
+        }
+      }))
+    };
+  }
+
+  function buildDebugProblemSnapshot(draft: ParsedProblemDraft, index: number): DebugProblemSnapshot {
+    return {
+      index,
+      id: draft.problem.id,
+      block: describeQuestionBlock(draft.block),
+      raw_text: truncate(draft.fullText, 6000),
+      extracted: {
+        prompt: draft.problem.prompt,
+        options: draft.options,
+        answer: draft.problem.answer,
+        correct_answer: draft.correctAnswer,
+        score_display: draft.problem.score_display,
+        explanation: draft.problem.explanation,
+        tags: draft.problem.tags,
+        images: draft.problem.images,
+        answer_source: draft.problem.answer_source,
+        review_needed: draft.problem.review_needed,
+        review_status: draft.problem.review_status,
+        review_verdict: draft.problem.review_verdict
+      },
+      evidence: draft.evidence,
+      confidence: draft.confidence,
+      warnings: draft.warnings
+    };
   }
 
   function extractIndexedAnswerScores(root: HTMLElement): Map<number, AnswerScore> {
@@ -631,11 +854,12 @@ interface ZipArchive {
       draft.problem.explanation = exactEvenScoreInference
         ? `${SCORE_INFERRED_NOTE} 当前页面未把本题得分放在题目块内，但整套题为单选题；按整卷得分 ${formatScore(totalScore)} / ${formatScore(fullScore)} 和已识别错题反推，该作答可视为正确。`
         : `${SCORE_INFERRED_NOTE} 当前页面只在部分题目块显示 0 分错题，未显示本题题内得分；结合整卷得分 ${formatScore(totalScore)} / ${formatScore(fullScore)}、已识别 ${knownWrongCount} 道 0 分题，以及本套题均为单选题，可将该作答暂按正确处理。`;
-      draft.problem.tags = draft.problem.tags.filter((tag) => tag !== '未批改' && tag !== 'AI批改');
-      addScoreInferenceTags(draft.problem.tags, draft.fullText, draft.answer, answerScore, draft.promptLine, draft.options);
-      for (const tag of [exactEvenScoreInference ? '整卷得分反推' : '结果页显示规则反推', '作答正确']) {
-        if (!draft.problem.tags.includes(tag)) draft.problem.tags.push(tag);
-      }
+      draft.problem.answer_source = 'score_inferred';
+      draft.problem.review_needed = false;
+      draft.problem.review_status = 'none';
+      draft.problem.review_verdict = 'correct';
+      draft.problem.review_confidence = 'unknown';
+      draft.problem.score_display = inferredScore;
     }
   }
 
@@ -700,22 +924,25 @@ interface ZipArchive {
     if (rawLines.length === 0) return null;
 
     const fullText = rawLines.join('\n');
-    const answer = extractStructuredUserAnswer(block) || extractAnswer(fullText);
+    const structuredCorrectAnswer = extractStructuredCorrectAnswer(block);
+    const textCorrectAnswer = structuredCorrectAnswer ? '' : extractCorrectAnswer(fullText);
+    const correctAnswer = structuredCorrectAnswer || textCorrectAnswer;
+    const structuredUserAnswer = extractStructuredUserAnswer(block);
+    const textUserAnswer = structuredUserAnswer ? '' : extractUserAnswerFromText(fullText);
+    const userAnswer = structuredUserAnswer || textUserAnswer;
+    const answer = correctAnswer || userAnswer;
     if (!answer) return null;
 
     const promptLine = extractPromptLine(rawLines, block);
     const options = extractOptions(rawLines);
-    const answerScore = extractStructuredAnswerScore(block) || extractAnswerScore(rawLines) || fallbackScore;
+    const structuredScore = extractStructuredAnswerScore(block);
+    const textScore = structuredScore ? null : extractAnswerScore(rawLines);
+    const answerScore = structuredScore || textScore || fallbackScore;
     const explanation = extractExplanation(rawLines, fullText, answer, answerScore, promptLine, options);
     const tags = extractTags(rawLines, block);
-    if (isTemporaryUserAnswer(fullText, answer) && !answerScore) {
-      for (const tag of ['未批改', 'AI批改']) {
-        if (!tags.includes(tag)) tags.push(tag);
-      }
-    }
-    addScoreInferenceTags(tags, fullText, answer, answerScore, promptLine, options);
+    const state = buildProblemState(fullText, correctAnswer, userAnswer, answer, answerScore, promptLine, options);
     const imageCandidates = textSnapshot(block).images;
-    const imageLines = imageCandidates.map((image, imageIndex) => `${IMAGE_PLACEHOLDER_PREFIX}${imageIndex + 1}: ${image.src}`);
+    const imageLines = imageCandidates.map((image, imageIndex) => `${IMAGE_PLACEHOLDER_PREFIX}${imageIndex + 1}: ${image.alt || '已内嵌到题库 images 字段'}`);
     const prompt = [promptLine, ...imageLines, ...options].filter(Boolean).join('\n');
 
     if (!prompt || prompt.length < 4) return null;
@@ -726,6 +953,12 @@ interface ZipArchive {
       answer,
       explanation,
       tags,
+      answer_source: state.answer_source,
+      review_needed: state.review_needed,
+      review_status: state.review_status,
+      review_verdict: state.review_verdict,
+      review_confidence: state.review_confidence,
+      score_display: state.score_display,
       images: imageCandidates.map((image, imageIndex) => ({
         filename: guessImageFilename(image.src, index, imageIndex),
         mime_type: guessMimeType(image.src),
@@ -735,7 +968,128 @@ interface ZipArchive {
       }))
     };
 
-    return { problem, promptLine, options, answer, fullText, answerScore };
+    const evidence: ExtractionEvidence = {
+      block_source: describeQuestionBlock(block).descriptor,
+      prompt_source: hasQuestionNumber(block) ? 'text:numbered-question' : 'structured-or-text:title',
+      options_source: options.length > 0 ? 'text:option-lines' : 'none',
+      correct_answer_source: structuredCorrectAnswer ? 'structured:correct-answer' : textCorrectAnswer ? 'text-label:correct-answer' : 'none',
+      answer_source: correctAnswer ? 'correct_answer' : userAnswer ? 'user_answer' : 'none',
+      score_source: structuredScore ? 'structured:score' : textScore ? 'text:score-line' : fallbackScore ? 'fallback:indexed-score' : 'none',
+      explanation_source: explanation ? (/答案解析|解析/.test(fullText) ? 'text-label:explanation' : 'generated:score-inferred') : 'none',
+      tags_source: tags.length > 0 ? 'text-or-dom:tags' : 'none'
+    };
+    const draft: ParsedProblemDraft = {
+      problem,
+      promptLine,
+      options,
+      answer,
+      correctAnswer,
+      userAnswer,
+      fullText,
+      answerScore,
+      block,
+      blockIndex: index,
+      evidence,
+      warnings: [],
+      confidence: 0
+    };
+    refreshDraftDiagnostics([draft]);
+    return draft;
+  }
+
+  function refreshDraftDiagnostics(drafts: ParsedProblemDraft[]): void {
+    for (const draft of drafts) {
+      draft.warnings = buildDraftWarnings(draft);
+      draft.confidence = scoreDraftConfidence(draft);
+    }
+  }
+
+  function buildDraftWarnings(draft: ParsedProblemDraft): string[] {
+    const warnings: string[] = [];
+    const answer = draft.problem.answer || '';
+    const prompt = draft.problem.prompt || '';
+    if (/我的答案|你的答案|作答答案|正确答案|参考答案|标准答案|答案解析|解析|知识点|得分/.test(answer)) {
+      warnings.push('answer_contains_result_text');
+    }
+    if (/\n\s*\d+(?:\.\d+)?\s*分\s*$/.test(answer)) warnings.push('answer_contains_score_line');
+    if (/我的答案|你的答案|正确答案|参考答案|标准答案|答案解析|解析|得分/.test(prompt)) {
+      warnings.push('prompt_contains_result_text');
+    }
+    if (!draft.correctAnswer && draft.problem.answer_source === 'standard') warnings.push('standard_source_without_correct_answer');
+    if (draft.options.length > 0 && draft.options.length < 2) warnings.push('too_few_options');
+    if (/多选题|多项选择|不定项|正确的有|包括|属于.+有/.test(draft.promptLine) && normalizeChoiceLikeAnswer(answer).length <= 1) {
+      warnings.push('possible_multi_choice_single_answer');
+    }
+    if (isJudgementPrompt(draft.options) && !/^(A|B|对|错|正确|错误|√|×)$/i.test(answer.trim())) {
+      warnings.push('judgement_answer_not_normalized');
+    }
+    return Array.from(new Set(warnings));
+  }
+
+  function scoreDraftConfidence(draft: ParsedProblemDraft): number {
+    let score = 0.45;
+    if (draft.evidence.block_source !== 'virtual:text-block') score += 0.08;
+    if (draft.evidence.correct_answer_source.startsWith('structured')) score += 0.25;
+    else if (draft.evidence.correct_answer_source.startsWith('text-label')) score += 0.15;
+    else if (draft.problem.answer_source === 'score_inferred') score += 0.02;
+    if (draft.options.length >= 2) score += 0.08;
+    if (draft.evidence.score_source.startsWith('structured')) score += 0.04;
+    score -= Math.min(0.35, draft.warnings.length * 0.08);
+    return Math.max(0, Math.min(1, Number(score.toFixed(2))));
+  }
+
+  function isJudgementPrompt(options: string[]): boolean {
+    if (options.length !== 2) return false;
+    const first = options[0].replace(/^A[\.、．]\s*/, '').trim();
+    const second = options[1].replace(/^B[\.、．]\s*/, '').trim();
+    return /^(对|正确|√)$/.test(first) && /^(错|错误|×)$/.test(second);
+  }
+
+  function buildProblemState(
+    fullText: string,
+    correctAnswer: string,
+    userAnswer: string,
+    answer: string,
+    answerScore: AnswerScore | null,
+    promptLine: string,
+    options: string[]
+  ): Pick<Problem, 'answer_source' | 'review_needed' | 'review_status' | 'review_verdict' | 'review_confidence' | 'score_display'> {
+    const state: Pick<Problem, 'answer_source' | 'review_needed' | 'review_status' | 'review_verdict' | 'review_confidence' | 'score_display'> = {
+      answer_source: 'standard',
+      review_needed: false,
+      review_status: 'none',
+      review_verdict: 'unknown',
+      review_confidence: 'unknown',
+      score_display: answerScore?.display || ''
+    };
+
+    if (correctAnswer) {
+      return state;
+    }
+
+    if (!userAnswer) {
+      return state;
+    }
+
+    if (!answerScore) {
+      state.answer_source = 'user_temporary';
+      state.review_needed = true;
+      state.review_status = 'pending';
+      return state;
+    }
+
+    state.answer_source = 'score_inferred';
+    const kind = inferTemporaryAnswerKind(answer, promptLine, options);
+    if (kind === 'single_choice') {
+      state.review_verdict = answerScore.value > 0 ? 'correct' : 'wrong';
+      state.review_needed = answerScore.value <= 0;
+      state.review_status = state.review_needed ? 'pending' : 'none';
+    } else {
+      state.review_verdict = answerScore.value <= 0 ? 'wrong' : 'unknown';
+      state.review_needed = true;
+      state.review_status = 'pending';
+    }
+    return state;
   }
 
   function getCleanLines(block: QuestionBlock): string[] {
@@ -761,6 +1115,11 @@ interface ZipArchive {
     const text = textSnapshot(el).text;
     const match = text.match(/^(?:#{1,6}\s*)?(\d+)\s*(?:、|[\.．](?!\d))/m);
     return match ? Number(match[1]) : Number.MAX_SAFE_INTEGER;
+  }
+
+  function hasQuestionNumber(block: QuestionBlock): boolean {
+    const text = textSnapshot(block).text;
+    return /^(?:#{1,6}\s*)?\d+\s*(?:、|[\.．](?!\d))/m.test(text);
   }
 
   function extractPromptLine(lines: string[], block: QuestionBlock): string {
@@ -877,34 +1236,42 @@ interface ZipArchive {
     return options;
   }
 
-  function extractAnswer(text: string): string {
-    const patterns = [
-      /正确答案\s*[:：]?\s*([A-H](?:\s*[,，、]\s*[A-H])*)/i,
-      /参考答案\s*[:：]?\s*([A-H](?:\s*[,，、]\s*[A-H])*)/i,
-      /标准答案\s*[:：]?\s*([A-H](?:\s*[,，、]\s*[A-H])*)/i,
-      /答案\s*[:：]?\s*([A-H](?:\s*[,，、]\s*[A-H])*)/i,
-      /正确答案\s*[:：]?\s*([^\n]+)/,
-      /参考答案\s*[:：]?\s*([^\n]+)/,
-      /标准答案\s*[:：]?\s*([^\n]+)/,
-      /\*{0,2}我的答案\*{0,2}\s*[:：]?\s*([^\n]+)/,
-      /\*{0,2}你的答案\*{0,2}\s*[:：]?\s*([^\n]+)/,
-      /\*{0,2}作答答案\*{0,2}\s*[:：]?\s*([^\n]+)/
-    ];
+  function extractCorrectAnswer(text: string): string {
+    return cleanExtractedAnswer(extractLabeledAnswerText(text, ['正确答案', '参考答案', '标准答案', '答案']));
+  }
 
-    for (const pattern of patterns) {
-      const match = text.match(pattern);
-      if (match && match[1]) {
-        const answer = cleanExtractedAnswer(match[1]);
-        if (answer) return answer;
+  function extractUserAnswerFromText(text: string): string {
+    return cleanExtractedAnswer(extractLabeledAnswerText(text, ['我的答案', '你的答案', '作答答案']));
+  }
+
+  function extractLabeledAnswerText(text: string, labels: string[]): string {
+    const escapedLabels = labels.map((label) => {
+      if (label === '答案') {
+        return '(?<!我的|你的|作答|正确|参考|标准|答案解析)答案';
       }
-    }
+      return escapeRegExp(label);
+    }).join('|');
+    const boundaryLabels = [
+      '正确答案', '参考答案', '标准答案', '答案',
+      '我的答案', '你的答案', '作答答案',
+      '答案解析', '解析', '知识点', '考点', '标签', '得分'
+    ].map(escapeRegExp).join('|');
+    const pattern = new RegExp(
+      `\\*{0,2}(?:${escapedLabels})\\*{0,2}\\s*[:：]?\\s*([\\s\\S]*?)(?=\\*{0,2}(?:${boundaryLabels})\\*{0,2}\\s*[:：]?|$)`,
+      'i'
+    );
+    const match = normalizeText(text).match(pattern);
+    return match?.[1] ? normalizeText(match[1]) : '';
+  }
 
-    return '';
+  function escapeRegExp(text: string): string {
+    return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   }
 
   function cleanExtractedAnswer(value: string): string {
     const normalized = normalizeAnswer(value)
       .replace(/^\*+|\*+$/g, '')
+      .replace(/\n\s*\d+(?:\.\d+)?\s*分\s*$/g, '')
       .replace(/(?:扫描预览|选择区域|重置区域|导出 CSV|ShuaForge 题库导出).*/g, '')
       .replace(/(?:答案解析|解析)\s*$/g, '')
       .replace(/^[,，、;；\s]+|[,，、;；\s]+$/g, '')
@@ -912,6 +1279,12 @@ interface ZipArchive {
 
     const labelledChoices = extractLabelledChoiceAnswer(normalized);
     if (labelledChoices) return labelledChoices;
+
+    const compactChoiceWithText = normalized.match(/^([A-H]{1,8})\s*[:：]\s*.+$/i)
+      || normalized.match(/^([A-H](?:\s*[,，、;；\s]\s*[A-H]){0,7})\s*[:：]\s*.+$/i);
+    if (compactChoiceWithText?.[1]) {
+      return Array.from(new Set(compactChoiceWithText[1].match(/[A-H]/gi)?.map((choice) => choice.toUpperCase()) || [])).join('');
+    }
 
     const choiceWithText = normalized.match(/^([A-H])\s*[:：]\s*.+$/i);
     const answer = choiceWithText ? choiceWithText[1].toUpperCase() : normalized;
@@ -928,6 +1301,37 @@ interface ZipArchive {
     return choices.join(',');
   }
 
+  function extractStructuredCorrectAnswer(block: QuestionBlock): string {
+    if (!isRealElement(block)) return '';
+    const candidates = [
+      '.mark_answer .mark_key',
+      '.mark_answer [class*="right" i][class*="answer" i]',
+      '.mark_answer [class*="correct" i][class*="answer" i]',
+      '.rightAnswer',
+      '.correctAnswer',
+      '[class*="rightAnswer" i]',
+      '[class*="correctAnswer" i]',
+      '[class*="right-answer" i]',
+      '[class*="correct-answer" i]'
+    ];
+
+    for (const selector of candidates) {
+      try {
+        for (const el of Array.from(block.querySelectorAll<HTMLElement>(selector))) {
+          const text = normalizeText(el.innerText || el.textContent || '');
+          if (!text) continue;
+          const hasCorrectLabel = /正确答案|参考答案|标准答案/.test(text);
+          if (!hasCorrectLabel) continue;
+          const answer = extractCorrectAnswer(text) || cleanExtractedAnswer(text);
+          if (answer) return answer;
+        }
+      } catch {
+        // 忽略不兼容选择器。
+      }
+    }
+    return '';
+  }
+
   function extractStructuredUserAnswer(block: QuestionBlock): string {
     if (!isRealElement(block)) return '';
     const candidates = [
@@ -941,7 +1345,7 @@ interface ZipArchive {
       try {
         const el = block.querySelector<HTMLElement>(selector);
         const text = el ? normalizeText(el.innerText || el.textContent || '') : '';
-        const answer = cleanExtractedAnswer(text);
+        const answer = extractUserAnswerFromText(text) || cleanExtractedAnswer(text);
         if (answer) return answer;
       } catch {
         // 忽略不兼容选择器。
@@ -1042,35 +1446,6 @@ interface ZipArchive {
     return `${SCORE_INFERRED_NOTE} 当前作答得分 ${answerScore.display} 分；填空/主观题评分规则不确定，需人工复核后再作为标准答案使用。`;
   }
 
-  function addScoreInferenceTags(
-    tags: string[],
-    fullText: string,
-    answer: string,
-    answerScore: AnswerScore | null,
-    promptLine: string,
-    options: string[]
-  ): void {
-    if (!answerScore || !isTemporaryUserAnswer(fullText, answer)) return;
-
-    const kind = inferTemporaryAnswerKind(answer, promptLine, options);
-    const inferredTags = ['无标准答案', '按得分推断', `本题得分:${answerScore.display}分`];
-
-    if (kind === 'single_choice') {
-      inferredTags.push(answerScore.value > 0 ? '作答正确' : '作答错误');
-      if (answerScore.value <= 0) inferredTags.push('待复核');
-    } else if (kind === 'multiple_choice') {
-      inferredTags.push('多选需复核');
-      if (answerScore.value <= 0) inferredTags.push('作答错误');
-    } else {
-      inferredTags.push('填空需复核');
-      if (answerScore.value <= 0) inferredTags.push('作答错误');
-    }
-
-    for (const tag of inferredTags) {
-      if (!tags.includes(tag)) tags.push(tag);
-    }
-  }
-
   function inferTemporaryAnswerKind(answer: string, promptLine: string, options: string[]): 'single_choice' | 'multiple_choice' | 'text' {
     if (options.length < 2) return 'text';
     const normalizedChoice = normalizeChoiceLikeAnswer(answer);
@@ -1121,7 +1496,11 @@ interface ZipArchive {
   }
 
   function toCsv(problems: Problem[], bankInfo: BankInfo): string {
-    const rows: string[][] = [['id', 'prompt', 'answer', 'explanation', 'tags', 'deck_name', 'deck_info', 'images']];
+    const rows: string[][] = [[
+      'id', 'prompt', 'answer', 'explanation', 'tags', 'deck_name', 'deck_info', 'images',
+      'answer_source', 'review_needed', 'review_status', 'review_verdict', 'review_confidence',
+      'score_display'
+    ]];
     for (const problem of problems) {
       rows.push([
         problem.id,
@@ -1131,7 +1510,13 @@ interface ZipArchive {
         (problem.tags || []).join(','),
         bankInfo.name,
         bankInfo.info,
-        JSON.stringify(problem.images || [])
+        JSON.stringify(problem.images || []),
+        problem.answer_source,
+        problem.review_needed ? 'true' : 'false',
+        problem.review_status,
+        problem.review_verdict,
+        problem.review_confidence,
+        problem.score_display || ''
       ]);
     }
     return rows.map((row) => row.map(csvCell).join(',')).join('\r\n');
@@ -1239,6 +1624,28 @@ interface ZipArchive {
 
   function countImages(problems: Problem[]): number {
     return problems.reduce((total, problem) => total + (problem.images?.length || 0), 0);
+  }
+
+  function describeQuestionBlock(block: QuestionBlock): DebugBlockInfo {
+    const textLength = textSnapshot(block).text.length;
+    if (!isRealElement(block)) {
+      return {
+        kind: 'virtual',
+        tag: block.tagName || 'VIRTUAL',
+        id: '',
+        class_name: block.className || VIRTUAL_BLOCK_CLASS,
+        descriptor: 'virtual:text-block',
+        text_length: textLength
+      };
+    }
+    return {
+      kind: 'element',
+      tag: block.tagName.toLowerCase(),
+      id: block.id || '',
+      class_name: String(block.className || ''),
+      descriptor: describeElement(block),
+      text_length: textLength
+    };
   }
 
   async function ensureZipLibrary(): Promise<new () => ZipArchive> {
@@ -1397,6 +1804,9 @@ interface ZipArchive {
       getProblem(id: string) {
         if (lastProblems.length === 0) lastProblems = extractProblems(selectedRoot || document.body);
         return lastProblems.find((problem) => problem.id === id) || null;
+      },
+      snapshot(root?: HTMLElement) {
+        return buildDebugSnapshot(root || selectedRoot || document.body);
       }
     };
     Object.defineProperty(window, 'ShuaForgeQuestionBank', { value: api, configurable: true });

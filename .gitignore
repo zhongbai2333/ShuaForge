@@ -23,3 +23,19 @@ target/
 # Node / TypeScript userscript build
 node_modules/
 userscripts/*.user.js
+
+# Android Studio / Gradle generated files
+android/.gradle/
+android/build/
+android/local.properties
+android/app/bin/
+android/app/build/
+
+# Android signing keystore (NEVER commit)
+*.keystore
+*.jks
+local-secrets/
+.secrets/
+
+.vscode/
+.idea/
